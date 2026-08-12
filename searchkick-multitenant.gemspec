@@ -4,7 +4,7 @@ Gem::Specification.new do |spec|
   spec.name          = "searchkick-multitenant"
   spec.version       = Searchkick::MultiTenant::VERSION
   spec.summary       = "Shared-index multitenancy for Searchkick"
-  spec.homepage      = "https://github.com/ankane/searchkick" # placeholder
+  spec.homepage      = "https://github.com/zavy360/searchkick-multitenant"
   spec.license       = "MIT"
 
   spec.author        = "Victor Rudolfsson"
