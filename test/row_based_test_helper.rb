@@ -8,11 +8,14 @@ require "searchkick/multi_tenant"
 Searchkick.redis = RedisClient.new
 require "minitest/autorun"
 
+ActiveJob::Base.queue_adapter = :test
+
 ActiveRecord::Base.establish_connection(adapter: "sqlite3", database: ":memory:")
 ActiveRecord::Schema.define do
   create_table :tickets do |t|
     t.string :name
     t.string :account_id
+    t.boolean :archived, default: false
   end
 end
 
@@ -21,6 +24,8 @@ end
 class Ticket < ActiveRecord::Base
   searchkick callbacks: :inline
   searchkick_multitenant tenant: :account_id, tenant_scope: ->(tenant, &block) { block.call(where(account_id: tenant)) }
+
+  scope :active, -> { where(archived: false) }
 end
 
 Searchkick::MultiTenant.configure do |c|
