@@ -82,7 +82,11 @@ module Searchkick::MultiTenant
         return {index_name: new_index.name, incomplete_tenants: remaining, promoted: false}
       end
 
-      wait_for_batches(new_index) if @mode == :async && @wait
+      if @mode == :async && @wait
+        puts "Created index: #{new_index.name}"
+        puts "Jobs queued. Waiting..."
+        wait_for_batches(new_index)
+      end
 
       if alias_existed
         # Index#check_uuid does exactly this, but it's a protected method —
@@ -91,9 +95,11 @@ module Searchkick::MultiTenant
           raise Error, "Safety check failed - only run one Model.reindex/TenantReindexer per model at a time"
         end
 
+        puts "Jobs complete. Promoting..." if @mode == :async && @wait
         @index.promote(new_index.name, update_refresh_interval: !@refresh_interval.nil?)
       end
       @index.clean_indices unless @retain
+      puts "SUCCESS!" if @mode == :async && @wait
 
       {index_name: new_index.name, incomplete_tenants: remaining, promoted: true}
     end
@@ -156,6 +162,7 @@ module Searchkick::MultiTenant
         sleep 3
         status = Searchkick.reindex_status(new_index.name)
         break if status[:completed]
+        puts "Batches left: #{status[:batches_left]}"
       end
     end
   end
