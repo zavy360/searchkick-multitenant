@@ -23,10 +23,22 @@ module Searchkick
     #
     # Fix: capture the ambient tenant at enqueue time — `serialize` runs
     # synchronously inside `perform_later`, in whatever context actually
-    # initiated the job (a record save, or TenantReindexer's per-tenant
-    # loop) — and thread it through `searchkick_tenant_scope` instead of
-    # the bare unscoped class, so both the DB fetch AND the constructed
-    # delete record resolve against the correct tenant.
+    # initiated the job — and thread it through `searchkick_tenant_scope`
+    # instead of the bare unscoped class, so both the DB fetch AND the
+    # constructed delete record resolve against the correct tenant.
+    #
+    # This ambient-current_tenant capture is correct for ReindexV2Job and
+    # for BulkReindexJob's plain callback-triggered path (a normal app save
+    # runs inside whatever tenant context the app is actually in). It is
+    # NOT correct for BulkReindexJob when enqueued from TenantReindexer's
+    # own per-tenant loop (relation_indexer_ext.rb's full_reindex_async
+    # path): that loop never touches "current tenant" ambient state at all
+    # for row-based tenancy (tenant_scope is a pure `.where(...)` filter,
+    # no side effect), so ambient capture there would just grab whatever's
+    # leftover from outside the loop entirely — not the tenant actually
+    # being imported. For that path, relation_indexer_ext.rb passes the
+    # real tenant through as an explicit `multitenant_tenant:` argument on
+    # the job itself, which BulkReindexJobExt prefers over this ambient one.
     module CapturesTenantAtEnqueue
       def serialize
         tenant =
@@ -58,14 +70,22 @@ module Searchkick
     end
 
     module BulkReindexJobExt
-      def perform(class_name:, record_ids: nil, index_name: nil, method_name: nil, batch_id: nil, min_id: nil, max_id: nil, ignore_missing: nil)
+      # multitenant_tenant: is a keyword this gem adds, not part of stock
+      # Searchkick — present (non-nil) only when relation_indexer_ext.rb's
+      # batch_job explicitly set it for a TenantReindexer-driven import.
+      # Falls back to the ambient-captured @multitenant_tenant (from
+      # CapturesTenantAtEnqueue) for the plain callback-triggered path.
+      def perform(class_name:, record_ids: nil, index_name: nil, method_name: nil, batch_id: nil, min_id: nil, max_id: nil, ignore_missing: nil, multitenant_tenant: nil)
         model = Searchkick.load_model(class_name)
-        return super unless Searchkick::MultiTenant.enabled_for?(model)
+        unless Searchkick::MultiTenant.enabled_for?(model)
+          return super(class_name: class_name, record_ids: record_ids, index_name: index_name, method_name: method_name, batch_id: batch_id, min_id: min_id, max_id: max_id, ignore_missing: ignore_missing)
+        end
 
         index = model.searchkick_index(name: index_name)
         ids = record_ids || (min_id..max_id)
+        tenant = multitenant_tenant || @multitenant_tenant
 
-        model.searchkick_tenant_scope(@multitenant_tenant) do |relation|
+        model.searchkick_tenant_scope(tenant) do |relation|
           relation = Searchkick.load_records(relation, ids)
           relation = relation.search_import if relation.respond_to?(:search_import)
           Searchkick::RecordIndexer.new(index).reindex(relation, mode: :inline, method_name: method_name, ignore_missing: ignore_missing, full: false)

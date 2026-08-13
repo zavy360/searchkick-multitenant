@@ -161,10 +161,12 @@ places that needed a guard, beyond the write/read/search/reindex hooks in the ta
   `searchkick:reindex:all`, which call it the same way. Without this, it would silently rebuild the
   shared index from only whichever tenant is ambient at call time and promote over every other
   tenant's data. Rather than raise and push a different API onto every caller, it redirects to
-  `TenantReindexer.call` under the hood, so the standard interface Just Works. The handful of
-  options `TenantReindexer` has no equivalent for (`import: false`, `refresh_interval:`, `scope:`,
-  `wait:`) still raise rather than being silently dropped — call `TenantReindexer.call` directly for
-  that level of control (see [Advanced: TenantReindexer](#advanced-tenantreindexer)).
+  `TenantReindexer.call` under the hood, so the standard interface Just Works —
+  `Model.reindex(mode: :async, wait: true)`, `Model.reindex(scope: :active)`, and
+  `Model.reindex(refresh_interval: "30s")` all mean the same thing they do in stock Searchkick, just
+  applied across every tenant. Only `import: false` has no tenant-aware equivalent and still raises
+  — call `TenantReindexer.call` directly for that level of control (see
+  [Advanced: TenantReindexer](#advanced-tenantreindexer)).
 - **`Relation#rewhere`/`#only`/`#except` reapply the tenant filter.** The query-time `where:`
   injection happens once, in `Searchkick.search`, before `Relation.new` is constructed — but
   `rewhere!` unconditionally replaces `@options[:where]` wholesale, and `only`/`except` rebuild via
@@ -183,6 +185,16 @@ places that needed a guard, beyond the write/read/search/reindex hooks in the ta
   tenant filter from the bucket, leaking other tenants' bucket keys/counts even though `hits` stays
   correctly scoped. Aggregating any other field is unaffected. Pass `smart_aggs: false` if this is
   intentional.
+- **`mode: :async` batches are kept from colliding across tenants.** `RelationIndexer#full_reindex_async`
+  numbers batches `1, 2, 3...` fresh on every call, but `TenantReindexer` calls it once per tenant
+  against the same shared index — so two tenants' "batch 1" would otherwise collide as the literal
+  same member in Searchkick's own `batches_key` Redis set (keyed only by index name, so completion
+  aggregates across every tenant for free — that part's intentional). Whichever tenant's batch
+  finished first would remove that shared entry, making `wait: true` (or anything else polling
+  `Searchkick.reindex_status`) report done while another tenant's same-numbered batch was still
+  running. `Module#prepend` on `Searchkick::RelationIndexer` qualifies each batch id with the tenant
+  it belongs to (an explicit argument threaded through the call, not ambient state) so every
+  tenant's batches occupy distinct set members while still sharing one key.
 
 Checked and confirmed **not** a gap: `record.similar` (goes through `Searchkick.search` like any
 other query), `Index#retrieve` (id-based single-doc fetch, no query/where involved),
@@ -196,8 +208,9 @@ enclosing filter array).
 ## Advanced: TenantReindexer
 
 `Model.reindex` delegates to `Searchkick::MultiTenant::TenantReindexer` under the hood, so you don't
-need to call it directly for normal use. Reach for it when you need control `Model.reindex` doesn't
-expose:
+need to call it directly for normal use — `mode:`, `scope:`, `wait:`, `refresh_interval:`, `retain:`,
+and `job_options:` all reach it the same way they would through stock `Model.reindex`. Reach for it
+directly when you need control `Model.reindex` doesn't expose:
 
 **Resuming a failed reindex.** A tenant's import is retried a few times before being treated as
 failed; if any tenant is still outstanding, the run raises `Searchkick::MultiTenant::PartialReindexError`

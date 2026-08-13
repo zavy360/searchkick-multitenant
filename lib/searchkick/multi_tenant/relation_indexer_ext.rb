@@ -33,7 +33,13 @@ module Searchkick
       end
 
       def batch_job(class_name, batch_id, job_options, **options)
-        batch_id = "#{@multitenant_tenant}::#{batch_id}" if @multitenant_tenant
+        if @multitenant_tenant
+          batch_id = "#{@multitenant_tenant}::#{batch_id}"
+          # explicit, not ambient: this loop never touches "current tenant"
+          # state for row-based tenancy, so BulkReindexJobExt can't rely on
+          # CapturesTenantAtEnqueue's ambient capture here — see async_job_ext.rb
+          options = options.merge(multitenant_tenant: @multitenant_tenant)
+        end
         super(class_name, batch_id, job_options, **options)
       end
     end
