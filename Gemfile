@@ -2,7 +2,7 @@ source "https://rubygems.org"
 
 gemspec
 
-gem "searchkick", path: "../searchkick"
+gem "searchkick", '~> 6.1.2'
 
 gem "rake"
 gem "minitest"
