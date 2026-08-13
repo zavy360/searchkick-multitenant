@@ -27,8 +27,9 @@ module Searchkick::MultiTenant
       new(model, **options).call
     end
 
-    def initialize(model, mode: :inline, retain: false, job_options: nil, resume: false, force_promote_incomplete: false)
+    def initialize(model, mode: :inline, retain: false, job_options: nil, resume: false, force_promote_incomplete: false, scope: nil, wait: nil, refresh_interval: nil)
       raise Error, "Searchkick.redis not set" unless Searchkick.redis
+      raise ArgumentError, "wait only available in :async mode" if !wait.nil? && mode != :async
 
       @model = model
       @mode = mode
@@ -36,6 +37,9 @@ module Searchkick::MultiTenant
       @job_options = job_options
       @resume = resume
       @force_promote_incomplete = force_promote_incomplete
+      @scope = scope
+      @wait = wait
+      @refresh_interval = refresh_interval
       @index = model.searchkick_index
     end
 
@@ -51,7 +55,7 @@ module Searchkick::MultiTenant
       # import when no alias exists yet)
       unless alias_existed
         @index.delete if @index.exists?
-        @index.promote(new_index.name)
+        @index.promote(new_index.name, update_refresh_interval: !@refresh_interval.nil?)
       end
 
       pending_tenants(tenants_key).each do |tenant|
@@ -66,6 +70,24 @@ module Searchkick::MultiTenant
       remaining = pending_tenants(tenants_key)
       raise PartialReindexError, remaining if remaining.any? && !@force_promote_incomplete
 
+      # :async without wait: every tenant's import jobs are enqueued (they
+      # all target new_index, so Searchkick's own batches_key — keyed only
+      # by index name — aggregates completion across every tenant for
+      # free), but they haven't necessarily run yet. Promoting here would
+      # promote a possibly-empty index. Matches Searchkick's own full_reindex:
+      # leave it unpromoted and let the caller finish the job later — poll
+      # `Searchkick.reindex_status(new_index.name)` directly, or call this
+      # again with `resume: true, wait: true` to block until done and promote.
+      if @mode == :async && !@wait
+        return {index_name: new_index.name, incomplete_tenants: remaining, promoted: false}
+      end
+
+      if @mode == :async && @wait
+        puts "Created index: #{new_index.name}"
+        puts "Jobs queued. Waiting..."
+        wait_for_batches(new_index)
+      end
+
       if alias_existed
         # Index#check_uuid does exactly this, but it's a protected method —
         # inlined rather than reaching past that with `send`
@@ -73,20 +95,22 @@ module Searchkick::MultiTenant
           raise Error, "Safety check failed - only run one Model.reindex/TenantReindexer per model at a time"
         end
 
-        @index.promote(new_index.name)
+        puts "Jobs complete. Promoting..." if @mode == :async && @wait
+        @index.promote(new_index.name, update_refresh_interval: !@refresh_interval.nil?)
       end
       @index.clean_indices unless @retain
+      puts "SUCCESS!" if @mode == :async && @wait
 
-      {index_name: new_index.name, incomplete_tenants: remaining}
+      {index_name: new_index.name, incomplete_tenants: remaining, promoted: true}
     end
 
     # imports a single tenant into the CURRENTLY promoted index (no new
     # index, no promotion) — for backfilling a tenant onboarded after a
     # full reindex already ran, without needing to redo the whole thing.
-    def self.reindex_tenant(model, tenant, mode: :inline)
+    def self.reindex_tenant(model, tenant, mode: :inline, scope: nil)
       index = model.searchkick_index
       model.searchkick_tenant_scope(tenant) do |relation|
-        index.import_scope(relation, mode: mode, full: false)
+        index.import_scope(relation, mode: mode, full: false, scope: scope)
       end
     end
 
@@ -100,7 +124,9 @@ module Searchkick::MultiTenant
         Searchkick::Index.new(index_name, @model.searchkick_options)
       else
         @index.clean_indices unless @retain
-        @index.create_index
+        index_options = @model.searchkick_index_options
+        index_options.deep_merge!(settings: {index: {refresh_interval: @refresh_interval}}) if @refresh_interval
+        @index.create_index(index_options: index_options)
       end
     end
 
@@ -123,11 +149,20 @@ module Searchkick::MultiTenant
       begin
         attempts += 1
         @model.searchkick_tenant_scope(tenant) do |relation|
-          new_index.import_scope(relation, mode: @mode, full: true, job_options: @job_options)
+          new_index.import_scope(relation, mode: @mode, full: true, job_options: @job_options, scope: @scope, tenant: tenant)
         end
       rescue => e
         retry if attempts < RETRIES
         raise e
+      end
+    end
+
+    def wait_for_batches(new_index)
+      loop do
+        sleep 3
+        status = Searchkick.reindex_status(new_index.name)
+        break if status[:completed]
+        puts "Batches left: #{status[:batches_left]}"
       end
     end
   end

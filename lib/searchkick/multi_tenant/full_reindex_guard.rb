@@ -13,28 +13,34 @@ module Searchkick
     # reindex` is what apps, gems, and Searchkick's own rake tasks already
     # call by convention), redirect transparently to TenantReindexer, which
     # loops every tenant into the same new index before promoting — so the
-    # standard interface does the safe thing automatically.
+    # standard interface does the safe thing automatically. `mode:`,
+    # `retain:`, `job_options:`, `resume:`, `scope:`, `wait:`, and
+    # `refresh_interval:` all map onto TenantReindexer options with the same
+    # meaning as stock Searchkick.
     module FullReindexGuard
-      # options TenantReindexer has no equivalent for — rather than silently
-      # ignore them (diverging from what the caller explicitly asked for),
-      # fail loudly and point at TenantReindexer directly for full control.
-      UNMAPPABLE = [:import, :refresh_interval, :scope, :wait].freeze
-
       def full_reindex(relation, import: true, resume: false, retain: false, mode: nil, refresh_interval: nil, scope: nil, wait: nil, job_options: nil)
         model = relation.respond_to?(:searchkick_klass) ? relation.searchkick_klass : relation.klass
         return super unless Searchkick::MultiTenant.enabled_for?(model)
 
+        raise ArgumentError, "wait only available in :async mode" if !wait.nil? && mode != :async
         raise ArgumentError, "Full reindex does not support :queue mode - use :async mode instead" if mode == :queue
 
-        given = {import: import, refresh_interval: refresh_interval, scope: scope, wait: wait}
-        unsupported = given.select { |k, v| k == :import ? v == false : !v.nil? }
-        if unsupported.any?
+        if import == false
           raise Searchkick::MultiTenant::Error,
-            "#{model.name}.reindex(#{unsupported.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")}) isn't supported for tenant-enabled models — " \
+            "#{model.name}.reindex(import: false) isn't supported for tenant-enabled models — " \
             "call Searchkick::MultiTenant::TenantReindexer.call(#{model.name}) directly for full control."
         end
 
-        Searchkick::MultiTenant::TenantReindexer.call(model, mode: mode || :inline, retain: retain, job_options: job_options, resume: resume)
+        Searchkick::MultiTenant::TenantReindexer.call(
+          model,
+          mode: mode || :inline,
+          retain: retain,
+          job_options: job_options,
+          resume: resume,
+          scope: scope,
+          wait: wait,
+          refresh_interval: refresh_interval
+        )
       end
     end
   end
