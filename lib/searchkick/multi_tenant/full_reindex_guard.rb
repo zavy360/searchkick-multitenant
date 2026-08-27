@@ -15,17 +15,19 @@ module Searchkick
     # loops every tenant into the same new index before promoting — so the
     # standard interface does the safe thing automatically. `mode:`,
     # `retain:`, `job_options:`, `resume:`, `scope:`, `wait:`,
-    # `refresh_interval:`, and `replicas:` all map onto TenantReindexer
-    # options with the same meaning as stock Searchkick (stock itself has
-    # no `replicas:` — see the explicit super call below for why that
+    # `refresh_interval:`, `replicas:`, `global_scan:`, and `partitions:`
+    # all map onto TenantReindexer options with the same meaning as stock
+    # Searchkick (stock itself has none of `replicas:`/`global_scan:`/
+    # `partitions:` — see the explicit super call below for why that
     # matters).
     module FullReindexGuard
-      def full_reindex(relation, import: true, resume: false, retain: false, mode: nil, refresh_interval: Searchkick::MultiTenant::TenantReindexer::DEFAULT_REFRESH_INTERVAL, replicas: Searchkick::MultiTenant::TenantReindexer::DEFAULT_REPLICAS_DURING_REINDEX, scope: nil, wait: nil, job_options: nil)
+      def full_reindex(relation, import: true, resume: false, retain: false, mode: nil, refresh_interval: Searchkick::MultiTenant::TenantReindexer::DEFAULT_REFRESH_INTERVAL, replicas: Searchkick::MultiTenant::TenantReindexer::DEFAULT_REPLICAS_DURING_REINDEX, global_scan: false, partitions: Searchkick::MultiTenant::TenantReindexer::DEFAULT_PARTITIONS, scope: nil, wait: nil, job_options: nil)
         model = relation.respond_to?(:searchkick_klass) ? relation.searchkick_klass : relation.klass
         # explicit, not bare `super` — a bare super forwards every one of
-        # this method's keywords by name, including replicas:, which stock
-        # Searchkick's full_reindex doesn't declare at all and would raise
-        # ArgumentError: unknown keyword on for every disabled-model call
+        # this method's keywords by name, including replicas:/global_scan:/
+        # partitions:, which stock Searchkick's full_reindex doesn't declare
+        # at all and would raise ArgumentError: unknown keyword on for every
+        # disabled-model call
         unless Searchkick::MultiTenant.enabled_for?(model)
           return super(relation, import: import, resume: resume, retain: retain, mode: mode, refresh_interval: refresh_interval, scope: scope, wait: wait, job_options: job_options)
         end
@@ -48,7 +50,9 @@ module Searchkick
           scope: scope,
           wait: wait,
           refresh_interval: refresh_interval,
-          replicas: replicas
+          replicas: replicas,
+          global_scan: global_scan,
+          partitions: partitions
         )
       end
     end

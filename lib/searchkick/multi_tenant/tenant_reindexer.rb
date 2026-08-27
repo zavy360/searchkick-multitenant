@@ -2,10 +2,15 @@ module Searchkick::MultiTenant
   class PartialReindexError < Error
     attr_reader :failed_tenants
 
-    def initialize(failed_tenants)
+    # failed_tenants holds tenant identifiers for the normal per-tenant
+    # path, or "index:min_id:max_id" partition members for global_scan —
+    # kept as one attribute/message rather than a separate class so
+    # existing `rescue PartialReindexError => e; e.failed_tenants` callers
+    # don't need to branch on which mode produced it.
+    def initialize(failed_tenants, unit: "tenant")
       @failed_tenants = failed_tenants
-      super("Reindex incomplete - #{failed_tenants.size} tenant(s) did not complete: #{failed_tenants.join(", ")}. " \
-        "Index was NOT promoted. Re-run with resume: true to retry only the remaining tenants, " \
+      super("Reindex incomplete - #{failed_tenants.size} #{unit}(s) did not complete: #{failed_tenants.join(", ")}. " \
+        "Index was NOT promoted. Re-run with resume: true to retry only what's remaining, " \
         "or force_promote_incomplete: true to promote anyway (not recommended).")
     end
   end
@@ -37,14 +42,22 @@ module Searchkick::MultiTenant
     # own update_refresh_interval for replicas, so this gem manages it
     # directly — see restore_replicas). Pass replicas: nil to opt out.
     DEFAULT_REPLICAS_DURING_REINDEX = 0
+    # PartitionScanJob's own default id-range partition count for
+    # global_scan: true — a small, FIXED number of scanner jobs regardless
+    # of tenant count, which is the whole point (see PartitionScanJob's
+    # own comment). Bump it for more scan parallelism on a very large
+    # table; there's no connection-pool-sizing concern here the way there
+    # was for the old thread-pool attempt, since each is a real Sidekiq job.
+    DEFAULT_PARTITIONS = 10
 
     def self.call(model, **options)
       new(model, **options).call
     end
 
-    def initialize(model, mode: :inline, retain: false, job_options: nil, resume: false, force_promote_incomplete: false, scope: nil, wait: nil, refresh_interval: DEFAULT_REFRESH_INTERVAL, replicas: DEFAULT_REPLICAS_DURING_REINDEX)
+    def initialize(model, mode: :inline, retain: false, job_options: nil, resume: false, force_promote_incomplete: false, scope: nil, wait: nil, refresh_interval: DEFAULT_REFRESH_INTERVAL, replicas: DEFAULT_REPLICAS_DURING_REINDEX, global_scan: false, partitions: DEFAULT_PARTITIONS)
       raise Error, "Searchkick.redis not set" unless Searchkick.redis
       raise ArgumentError, "wait only available in :async mode" if !wait.nil? && mode != :async
+      raise ArgumentError, "global_scan only available in :async mode" if global_scan && mode != :async
 
       @model = model
       @mode = mode
@@ -56,14 +69,16 @@ module Searchkick::MultiTenant
       @wait = wait
       @refresh_interval = refresh_interval
       @replicas = replicas
+      @global_scan = global_scan
+      @partitions = partitions
       @index = model.searchkick_index
     end
 
     def call
       new_index = resolve_index
       alias_existed = @index.alias_exists?
-      tenants_key = "searchkick:multitenant:reindex:#{new_index.name}:tenants"
-      seed_checkpoint(tenants_key) unless @resume
+      checkpoint_key = "searchkick:multitenant:reindex:#{new_index.name}:#{@global_scan ? "partitions" : "tenants"}"
+      seed_checkpoint(checkpoint_key) unless @resume
       uuid = new_index.uuid
 
       # no prior serving index to protect — same bootstrap edge case
@@ -75,7 +90,22 @@ module Searchkick::MultiTenant
         restore_replicas(new_index)
       end
 
-      if @mode == :async
+      if @global_scan
+        # id-range PartitionScanJobs instead of per-tenant TenantImportJobs
+        # — see PartitionScanJob's own comment for why (composite-index-free
+        # row-based tenancy, and a fixed job count instead of one per tenant).
+        enqueue_partitions(new_index, checkpoint_key)
+
+        unless @wait
+          return {index_name: new_index.name, incomplete_tenants: pending_checkpoint(checkpoint_key), promoted: false}
+        end
+
+        log "Created index: #{new_index.name}"
+        log "Partition scans queued. Waiting for partitions..."
+        wait_for_checkpoint(checkpoint_key, label: "Partitions")
+        log "Partitions done. Waiting for batches..."
+        wait_for_batches(new_index)
+      elsif @mode == :async
         # each pending tenant's import runs as its OWN background job
         # (TenantImportJob) instead of inline here — that's what gives
         # concurrency across tenants: Sidekiq's own worker pool already
@@ -85,7 +115,7 @@ module Searchkick::MultiTenant
         # pool lifecycle management. See TenantImportJob's own comment for
         # why that matters and what the first (thread-based) attempt at
         # this got wrong.
-        enqueue_pending_tenants(new_index, tenants_key)
+        enqueue_pending_tenants(new_index, checkpoint_key)
 
         unless @wait
           # every tenant's import is enqueued, but none has necessarily
@@ -93,27 +123,29 @@ module Searchkick::MultiTenant
           # could promote a near-empty index. Leave it unpromoted and let
           # the caller finish later — poll `Searchkick.reindex_status`
           # directly, or call this again with `resume: true, wait: true`.
-          return {index_name: new_index.name, incomplete_tenants: pending_tenants(tenants_key), promoted: false}
+          return {index_name: new_index.name, incomplete_tenants: pending_checkpoint(checkpoint_key), promoted: false}
         end
 
         log "Created index: #{new_index.name}"
         log "Jobs queued. Waiting for tenants..."
-        wait_for_tenants(tenants_key)
+        wait_for_checkpoint(checkpoint_key, label: "Tenants")
         log "Tenants done. Waiting for batches..."
         wait_for_batches(new_index)
       else
-        pending_tenants(tenants_key).each do |tenant|
+        pending_checkpoint(checkpoint_key).each do |tenant|
           begin
             import_tenant(new_index, tenant)
-            remove_from_checkpoint(tenants_key, tenant)
+            remove_from_checkpoint(checkpoint_key, tenant)
           rescue => e
             Searchkick.warn("[searchkick-multitenant] tenant #{tenant.inspect} failed to reindex into #{new_index.name}: #{e.message}")
           end
         end
       end
 
-      remaining = pending_tenants(tenants_key)
-      raise PartialReindexError, remaining if remaining.any? && !@force_promote_incomplete
+      remaining = pending_checkpoint(checkpoint_key)
+      if remaining.any? && !@force_promote_incomplete
+        raise PartialReindexError.new(remaining, unit: @global_scan ? "partition" : "tenant")
+      end
 
       if alias_existed
         # Index#check_uuid does exactly this, but it's a protected method —
@@ -170,8 +202,8 @@ module Searchkick::MultiTenant
       end
     end
 
-    def remove_from_checkpoint(tenants_key, tenant)
-      Searchkick.with_redis { |r| r.call("SREM", tenants_key, tenant) }
+    def remove_from_checkpoint(checkpoint_key, member)
+      Searchkick.with_redis { |r| r.call("SREM", checkpoint_key, member) }
     end
 
     private
@@ -206,18 +238,54 @@ module Searchkick::MultiTenant
       index.update_settings(index: {number_of_replicas: configured})
     end
 
-    def seed_checkpoint(tenants_key)
-      tenants = []
-      Searchkick::MultiTenant.each_tenant { |tenant| tenants << tenant }
-      Searchkick.with_redis { |r| r.call("SADD", tenants_key, tenants) } if tenants.any?
+    def seed_checkpoint(checkpoint_key)
+      if @global_scan
+        seed_partitions(checkpoint_key)
+      else
+        tenants = []
+        Searchkick::MultiTenant.each_tenant { |tenant| tenants << tenant }
+        Searchkick.with_redis { |r| r.call("SADD", checkpoint_key, tenants) } if tenants.any?
+      end
     end
 
-    def pending_tenants(tenants_key)
-      Searchkick.with_redis { |r| r.call("SMEMBERS", tenants_key) } || []
+    # Partition members are self-describing strings ("index:min_id:max_id"),
+    # not bare partition numbers — so a resumed run just re-parses whatever
+    # is still in the Redis set from the ORIGINAL seed instead of
+    # recomputing ranges (which could shift if rows were added meanwhile,
+    # and resume is specifically about retrying exactly what didn't finish).
+    # Requires a numeric primary key — the id-range split below is
+    # arithmetic (min_id + i*size), unlike relation_indexer_ext.rb's
+    # find_in_batches-per-tenant path which needs no such assumption.
+    def seed_partitions(checkpoint_key)
+      primary_key = @model.primary_key
+      relation = @scope ? @model.all.send(@scope) : @model.all
+      min_id = relation.minimum(primary_key)
+      return if min_id.nil? # no records, nothing to partition
+
+      unless min_id.is_a?(Numeric)
+        raise Error, "global_scan: true requires a numeric primary key (got #{min_id.class})"
+      end
+
+      max_id = relation.maximum(primary_key)
+      size = ((max_id - min_id + 1) / @partitions.to_f).ceil
+
+      members = []
+      @partitions.times do |i|
+        range_min = min_id + (i * size)
+        break if range_min > max_id # requested more partitions than the id span supports
+
+        range_max = (i == @partitions - 1) ? max_id : [range_min + size - 1, max_id].min
+        members << "#{i}:#{range_min}:#{range_max}"
+      end
+      Searchkick.with_redis { |r| r.call("SADD", checkpoint_key, members) } if members.any?
+    end
+
+    def pending_checkpoint(checkpoint_key)
+      Searchkick.with_redis { |r| r.call("SMEMBERS", checkpoint_key) } || []
     end
 
     def enqueue_pending_tenants(new_index, tenants_key)
-      pending_tenants(tenants_key).each do |tenant|
+      pending_checkpoint(tenants_key).each do |tenant|
         TenantImportJob.set(**(@job_options || {})).perform_later(
           class_name: @model.name,
           tenant: tenant,
@@ -230,11 +298,26 @@ module Searchkick::MultiTenant
       end
     end
 
-    def wait_for_tenants(tenants_key)
+    def enqueue_partitions(new_index, partitions_key)
+      pending_checkpoint(partitions_key).each do |member|
+        _index, min_id, max_id = member.split(":")
+        PartitionScanJob.set(**(@job_options || {})).perform_later(
+          class_name: @model.name,
+          new_index_name: new_index.name,
+          partitions_key: partitions_key,
+          partition_id: member,
+          min_id: min_id.to_i,
+          max_id: max_id.to_i,
+          job_options: @job_options
+        )
+      end
+    end
+
+    def wait_for_checkpoint(checkpoint_key, label:)
       loop do
-        remaining = pending_tenants(tenants_key)
+        remaining = pending_checkpoint(checkpoint_key)
         break if remaining.empty?
-        log "Tenants left: #{remaining.size}"
+        log "#{label} left: #{remaining.size}"
         sleep 3
       end
     end
