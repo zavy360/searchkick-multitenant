@@ -45,7 +45,11 @@ class AsyncJobTest < Minitest::Test
     begin
       perform_enqueued_jobs
     ensure
-      Thread.current[:current_tenant] = "acme" # restore before teardown's as_tenant calls run
+      # nil, not "acme" — teardown's own as_tenant calls switch explicitly
+      # regardless, and leaving this at "acme" leaked into whichever test
+      # ran next in the same thread (minitest runs a class's tests
+      # sequentially, not one thread per test)
+      Thread.current[:current_tenant] = nil
     end
     Article.searchkick_index.refresh
 

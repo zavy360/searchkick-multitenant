@@ -22,12 +22,19 @@ module Searchkick::MultiTenant
   # tenants still in that set, instead of starting over.
   class TenantReindexer
     RETRIES = 3
+    # a full reindex bulk-imports every tenant before promoting — throttle
+    # refreshes during that import (ES/OpenSearch refresh is the expensive
+    # part of heavy bulk indexing), then restore to whatever the model is
+    # actually configured with (falls back to Searchkick's own "1s") on
+    # promote, same as passing refresh_interval: "30s" to stock Searchkick's
+    # full_reindex. Pass refresh_interval: nil explicitly to opt out.
+    DEFAULT_REFRESH_INTERVAL = "30s"
 
     def self.call(model, **options)
       new(model, **options).call
     end
 
-    def initialize(model, mode: :inline, retain: false, job_options: nil, resume: false, force_promote_incomplete: false, scope: nil, wait: nil, refresh_interval: nil)
+    def initialize(model, mode: :inline, retain: false, job_options: nil, resume: false, force_promote_incomplete: false, scope: nil, wait: nil, refresh_interval: DEFAULT_REFRESH_INTERVAL)
       raise Error, "Searchkick.redis not set" unless Searchkick.redis
       raise ArgumentError, "wait only available in :async mode" if !wait.nil? && mode != :async
 

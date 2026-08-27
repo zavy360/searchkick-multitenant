@@ -23,6 +23,22 @@ class SafetyGuardsTest < Minitest::Test
     assert_equal ["acme::1", "globex::1"], doc_ids, "Model.reindex must cover every tenant, not just the one ambient at call time"
   end
 
+  def test_bare_reindex_defaults_refresh_interval_to_30s
+    captured = nil
+    original = Searchkick::MultiTenant::TenantReindexer.method(:call)
+    Searchkick::MultiTenant::TenantReindexer.define_singleton_method(:call) do |model, **opts|
+      captured = opts
+      {index_name: model.searchkick_index.name, incomplete_tenants: [], promoted: true}
+    end
+    begin
+      Product.reindex
+    ensure
+      Searchkick::MultiTenant::TenantReindexer.define_singleton_method(:call, original)
+    end
+
+    assert_equal Searchkick::MultiTenant::TenantReindexer::DEFAULT_REFRESH_INTERVAL, captured[:refresh_interval]
+  end
+
   def test_reindex_with_unmappable_option_raises
     assert_raises(Searchkick::MultiTenant::Error) { Product.reindex(scope: :some_scope) }
   end

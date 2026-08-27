@@ -1,12 +1,17 @@
 module Searchkick::MultiTenant
   class Configuration
-    attr_accessor :current_tenant, :each_tenant, :routing, :batch_job_timeout, :batch_job_max_attempts, :use_reader_replica_for_reindex
+    attr_accessor :current_tenant, :each_tenant, :routing, :batch_job_timeout, :batch_job_max_attempts, :use_reader_replica_for_reindex, :enabled
     attr_writer :around_reindex_read
 
     def initialize
       @current_tenant = -> { raise Error, "Searchkick::MultiTenant.configure { |c| c.current_tenant = -> { ... } } is not set" }
       @each_tenant = ->(&block) { raise Error, "Searchkick::MultiTenant.configure { |c| c.each_tenant = ->(&block) { ... } } is not set" }
       @routing = false
+      # false makes every patch a no-op — searchkick_multitenant can be
+      # called on models and deployed with zero behavior change, then
+      # flipped on later without a code deploy (e.g. from an ENV var or
+      # feature flag) once you're ready to actually migrate.
+      @enabled = true
       @batch_job_timeout = 300 # seconds a single BulkReindexJob attempt may run before it's timed out
       @batch_job_max_attempts = 5 # attempts before we give up on a batch and unblock batches_left
       # set true to auto-read from a configured :reading role during full

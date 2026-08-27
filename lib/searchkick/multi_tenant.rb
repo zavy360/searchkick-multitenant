@@ -22,8 +22,12 @@ module Searchkick::MultiTenant
       config.each_tenant.call(&block)
     end
 
+    # the single gate every patched method in this gem checks before doing
+    # anything multitenant-specific — config.enabled = false makes all of
+    # them fall through to stock Searchkick behavior (see config.enabled's
+    # doc comment for why).
     def enabled_for?(klass)
-      klass.respond_to?(:searchkick_multitenant?) && klass.searchkick_multitenant?
+      config.enabled && klass.respond_to?(:searchkick_multitenant?) && klass.searchkick_multitenant?
     end
 
     def tenant_field(klass)

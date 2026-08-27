@@ -18,7 +18,7 @@ module Searchkick
     # `refresh_interval:` all map onto TenantReindexer options with the same
     # meaning as stock Searchkick.
     module FullReindexGuard
-      def full_reindex(relation, import: true, resume: false, retain: false, mode: nil, refresh_interval: nil, scope: nil, wait: nil, job_options: nil)
+      def full_reindex(relation, import: true, resume: false, retain: false, mode: nil, refresh_interval: Searchkick::MultiTenant::TenantReindexer::DEFAULT_REFRESH_INTERVAL, scope: nil, wait: nil, job_options: nil)
         model = relation.respond_to?(:searchkick_klass) ? relation.searchkick_klass : relation.klass
         return super unless Searchkick::MultiTenant.enabled_for?(model)
 

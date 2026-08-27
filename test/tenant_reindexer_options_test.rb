@@ -45,6 +45,25 @@ class TenantReindexerOptionsTest < Minitest::Test
     new_index&.delete
   end
 
+  # a full reindex bulk-imports every tenant into the new index before
+  # promoting — without throttling, ES/OpenSearch refreshes on every bulk
+  # write the whole time, which is the expensive part of heavy indexing.
+  def test_refresh_interval_defaults_to_30s_for_a_full_reindex
+    reindexer = Searchkick::MultiTenant::TenantReindexer.new(Ticket)
+    new_index = reindexer.send(:resolve_index)
+
+    settings = Searchkick.client.indices.get_settings(index: new_index.name)
+    assert_equal "30s", settings.values.first["settings"]["index"]["refresh_interval"]
+  ensure
+    new_index&.delete
+  end
+
+  def test_refresh_interval_is_restored_to_the_configured_value_on_promotion
+    Searchkick::MultiTenant::TenantReindexer.call(Ticket)
+
+    assert_equal "1s", Ticket.searchkick_index.refresh_interval, "Ticket doesn't configure its own refresh_interval, so promotion should fall back to Searchkick's stock default, not stay at the 30s used mid-reindex"
+  end
+
   def test_async_without_wait_defers_promotion_until_jobs_actually_run
     as_tenant("acme") { Ticket.create!(name: "Acme Ticket", account_id: "acme") }
     as_tenant("globex") { Ticket.create!(name: "Globex Ticket", account_id: "globex") }

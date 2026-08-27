@@ -5,6 +5,8 @@ module Searchkick::MultiTenant
   # the class would instead sit *below* or clobber that method.
   module SearchDataExt
     def search_data
+      return super unless Searchkick::MultiTenant.enabled_for?(self.class)
+
       super.merge(Searchkick::MultiTenant.tenant_field(self.class) => searchkick_tenant)
     end
   end
