@@ -14,13 +14,21 @@ module Searchkick
     # call by convention), redirect transparently to TenantReindexer, which
     # loops every tenant into the same new index before promoting — so the
     # standard interface does the safe thing automatically. `mode:`,
-    # `retain:`, `job_options:`, `resume:`, `scope:`, `wait:`, and
-    # `refresh_interval:` all map onto TenantReindexer options with the same
-    # meaning as stock Searchkick.
+    # `retain:`, `job_options:`, `resume:`, `scope:`, `wait:`,
+    # `refresh_interval:`, and `replicas:` all map onto TenantReindexer
+    # options with the same meaning as stock Searchkick (stock itself has
+    # no `replicas:` — see the explicit super call below for why that
+    # matters).
     module FullReindexGuard
-      def full_reindex(relation, import: true, resume: false, retain: false, mode: nil, refresh_interval: Searchkick::MultiTenant::TenantReindexer::DEFAULT_REFRESH_INTERVAL, scope: nil, wait: nil, job_options: nil)
+      def full_reindex(relation, import: true, resume: false, retain: false, mode: nil, refresh_interval: Searchkick::MultiTenant::TenantReindexer::DEFAULT_REFRESH_INTERVAL, replicas: Searchkick::MultiTenant::TenantReindexer::DEFAULT_REPLICAS_DURING_REINDEX, scope: nil, wait: nil, job_options: nil)
         model = relation.respond_to?(:searchkick_klass) ? relation.searchkick_klass : relation.klass
-        return super unless Searchkick::MultiTenant.enabled_for?(model)
+        # explicit, not bare `super` — a bare super forwards every one of
+        # this method's keywords by name, including replicas:, which stock
+        # Searchkick's full_reindex doesn't declare at all and would raise
+        # ArgumentError: unknown keyword on for every disabled-model call
+        unless Searchkick::MultiTenant.enabled_for?(model)
+          return super(relation, import: import, resume: resume, retain: retain, mode: mode, refresh_interval: refresh_interval, scope: scope, wait: wait, job_options: job_options)
+        end
 
         raise ArgumentError, "wait only available in :async mode" if !wait.nil? && mode != :async
         raise ArgumentError, "Full reindex does not support :queue mode - use :async mode instead" if mode == :queue
@@ -39,7 +47,8 @@ module Searchkick
           resume: resume,
           scope: scope,
           wait: wait,
-          refresh_interval: refresh_interval
+          refresh_interval: refresh_interval,
+          replicas: replicas
         )
       end
     end

@@ -64,6 +64,27 @@ class TenantReindexerOptionsTest < Minitest::Test
     assert_equal "1s", Ticket.searchkick_index.refresh_interval, "Ticket doesn't configure its own refresh_interval, so promotion should fall back to Searchkick's stock default, not stay at the 30s used mid-reindex"
   end
 
+  # a full reindex bulk-writes every tenant into the new index before
+  # promoting — every replica would otherwise have to independently apply
+  # every one of those writes too, for no benefit until the index is live.
+  def test_replicas_defaults_to_0_for_a_full_reindex
+    reindexer = Searchkick::MultiTenant::TenantReindexer.new(Ticket)
+    new_index = reindexer.send(:resolve_index)
+
+    settings = Searchkick.client.indices.get_settings(index: new_index.name)
+    assert_equal "0", settings.values.first["settings"]["index"]["number_of_replicas"]
+  ensure
+    new_index&.delete
+  end
+
+  def test_replicas_is_restored_to_the_configured_value_on_promotion
+    Searchkick::MultiTenant::TenantReindexer.call(Ticket)
+
+    settings = Searchkick.client.indices.get_settings(index: Ticket.searchkick_index.name)
+    assert_equal "1", settings.values.first["settings"]["index"]["number_of_replicas"],
+      "Ticket doesn't configure its own replicas, so promotion should fall back to 1 (Elasticsearch/OpenSearch's own default), not stay at the 0 used mid-reindex"
+  end
+
   def test_async_without_wait_defers_promotion_until_jobs_actually_run
     as_tenant("acme") { Ticket.create!(name: "Acme Ticket", account_id: "acme") }
     as_tenant("globex") { Ticket.create!(name: "Globex Ticket", account_id: "globex") }
@@ -84,5 +105,48 @@ class TenantReindexerOptionsTest < Minitest::Test
     Ticket.searchkick_index.refresh
     names = Searchkick.client.search(index: Ticket.searchkick_index.name, body: {query: {match_all: {}}})["hits"]["hits"].map { |h| h["_source"]["name"] }.sort
     assert_equal ["Acme Ticket", "Globex Ticket"], names
+  end
+
+  # regression test for a real production bug: RelationIndexer#full_reindex_async
+  # (stock Searchkick) derives batch COUNT from (tenant's max_id - tenant's
+  # min_id) / batch_size, assuming ids in that span are packed densely.
+  # True for schema-based tenancy (each tenant has its own table/id
+  # sequence). False for row-based tenancy on this shared `tickets` table —
+  # tenants interleave in the same id sequence, so one tenant's min/max id
+  # can span nearly the whole table even though it owns few of the rows in
+  # between, wildly inflating the batch count (seen in prod: ~35x).
+  #
+  # 6 rows interleaved acme/globex/acme/globex/acme/globex means acme's own
+  # ids span 1..5 despite acme owning only 3 rows — at batch_size 2 the old
+  # id-span math would derive 3 batches (ceil(5/2)) from that span; correct
+  # batching (walking acme's actual 3 rows) must derive 2 (ceil(3/2)).
+  def test_row_based_batch_count_matches_actual_rows_not_id_span
+    clear_enqueued_jobs
+    as_tenant("acme") { Ticket.create!(name: "A1", account_id: "acme") }
+    as_tenant("globex") { Ticket.create!(name: "G1", account_id: "globex") }
+    as_tenant("acme") { Ticket.create!(name: "A2", account_id: "acme") }
+    as_tenant("globex") { Ticket.create!(name: "G2", account_id: "globex") }
+    as_tenant("acme") { Ticket.create!(name: "A3", account_id: "acme") }
+    as_tenant("globex") { Ticket.create!(name: "G3", account_id: "globex") }
+
+    with_stubbed_batch_size(2) do
+      Searchkick::MultiTenant::TenantReindexer.call(Ticket, mode: :async)
+    end
+
+    bulk_jobs = enqueued_jobs.select { |j| j[:job] == Searchkick::BulkReindexJob }
+    assert_equal 4, bulk_jobs.size, "3 rows per tenant at batch_size 2 should be 2 batches per tenant (4 total), not batches derived from each tenant's full id span"
+  end
+
+  private
+
+  # RelationIndexer#batch_size is a private, per-instance-memoized method —
+  # swap it on the class for the duration of the test rather than adding a
+  # searchkick batch_size: config just for this one test.
+  def with_stubbed_batch_size(value)
+    original = Searchkick::RelationIndexer.instance_method(:batch_size)
+    Searchkick::RelationIndexer.send(:define_method, :batch_size) { value }
+    yield
+  ensure
+    Searchkick::RelationIndexer.send(:define_method, :batch_size, original)
   end
 end

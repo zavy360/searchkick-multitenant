@@ -42,6 +42,36 @@ module Searchkick
         end
         super(class_name, batch_id, job_options, **options)
       end
+
+      # RelationIndexer#full_reindex_async's numeric-primary-key branch
+      # computes batch COUNT from (max_id - min_id) / batch_size — assuming
+      # ids in that range are packed densely. True for schema-based tenancy
+      # (each tenant has its own table, its own tight id sequence). False
+      # for row-based tenancy on a shared/global table: every tenant draws
+      # from the SAME id sequence, so one tenant's min/max id can span
+      # nearly the entire table even though that tenant owns a tiny
+      # fraction of the rows in between. The result: massively inflated
+      # batch counts (seen in production: ~35x), where most batches carry
+      # a min_id..max_id window that belongs mostly to OTHER tenants and
+      # matches few or zero of this tenant's own rows once
+      # searchkick_tenant_scope's WHERE is applied.
+      #
+      # Fix: for a tenant-scoped call, always batch by actual matching
+      # rows (record_ids:, walked via find_in_batches) instead of a
+      # min_id/max_id window — exactly what stock Searchkick already does
+      # for non-numeric primary keys, just applied unconditionally here
+      # since "the id range is dense" can't be assumed once a relation is
+      # tenant-scoped on a shared table.
+      def full_reindex_async(relation, job_options: nil)
+        return super unless @multitenant_tenant
+
+        batch_id = 1
+        class_name = relation.searchkick_options[:class_name]
+        in_batches(relation) do |items|
+          batch_job(class_name, batch_id, job_options, record_ids: items.map(&:id).map { |v| v.instance_of?(Integer) ? v : v.to_s })
+          batch_id += 1
+        end
+      end
     end
   end
 end

@@ -29,12 +29,20 @@ module Searchkick::MultiTenant
     # promote, same as passing refresh_interval: "30s" to stock Searchkick's
     # full_reindex. Pass refresh_interval: nil explicitly to opt out.
     DEFAULT_REFRESH_INTERVAL = "30s"
+    # same reasoning as DEFAULT_REFRESH_INTERVAL: a full reindex bulk-writes
+    # every tenant, and every replica has to independently apply every one
+    # of those writes — 0 replicas during the import means only the primary
+    # shard does that work. Restored to whatever the model is actually
+    # configured with on promote (stock Searchkick has no equivalent of its
+    # own update_refresh_interval for replicas, so this gem manages it
+    # directly — see restore_replicas). Pass replicas: nil to opt out.
+    DEFAULT_REPLICAS_DURING_REINDEX = 0
 
     def self.call(model, **options)
       new(model, **options).call
     end
 
-    def initialize(model, mode: :inline, retain: false, job_options: nil, resume: false, force_promote_incomplete: false, scope: nil, wait: nil, refresh_interval: DEFAULT_REFRESH_INTERVAL)
+    def initialize(model, mode: :inline, retain: false, job_options: nil, resume: false, force_promote_incomplete: false, scope: nil, wait: nil, refresh_interval: DEFAULT_REFRESH_INTERVAL, replicas: DEFAULT_REPLICAS_DURING_REINDEX)
       raise Error, "Searchkick.redis not set" unless Searchkick.redis
       raise ArgumentError, "wait only available in :async mode" if !wait.nil? && mode != :async
 
@@ -47,6 +55,7 @@ module Searchkick::MultiTenant
       @scope = scope
       @wait = wait
       @refresh_interval = refresh_interval
+      @replicas = replicas
       @index = model.searchkick_index
     end
 
@@ -63,6 +72,7 @@ module Searchkick::MultiTenant
       unless alias_existed
         @index.delete if @index.exists?
         @index.promote(new_index.name, update_refresh_interval: !@refresh_interval.nil?)
+        restore_replicas(new_index)
       end
 
       pending_tenants(tenants_key).each do |tenant|
@@ -104,6 +114,7 @@ module Searchkick::MultiTenant
 
         puts "Jobs complete. Promoting..." if @mode == :async && @wait
         @index.promote(new_index.name, update_refresh_interval: !@refresh_interval.nil?)
+        restore_replicas(new_index)
       end
       @index.clean_indices unless @retain
       puts "SUCCESS!" if @mode == :async && @wait
@@ -133,8 +144,24 @@ module Searchkick::MultiTenant
         @index.clean_indices unless @retain
         index_options = @model.searchkick_index_options
         index_options.deep_merge!(settings: {index: {refresh_interval: @refresh_interval}}) if @refresh_interval
+        index_options.deep_merge!(settings: {index: {number_of_replicas: @replicas}}) unless @replicas.nil?
         @index.create_index(index_options: index_options)
       end
+    end
+
+    # stock Searchkick's promote only knows how to restore refresh_interval
+    # (update_refresh_interval:) — no equivalent exists for replicas, so
+    # this reads the model's actually-configured value straight off @index
+    # (the model's live, unmodified searchkick_options — same source stock
+    # Searchkick's own refresh_interval restore reads from) the same way,
+    # falling back to 1 (Elasticsearch/OpenSearch's own out-of-the-box
+    # default) when the model doesn't configure one explicitly, mirroring
+    # that same "1s" fallback precedent for refresh_interval.
+    def restore_replicas(index)
+      return if @replicas.nil?
+
+      configured = @index.options.dig(:settings, :index, :number_of_replicas) || 1
+      index.update_settings(index: {number_of_replicas: configured})
     end
 
     def seed_checkpoint(tenants_key)

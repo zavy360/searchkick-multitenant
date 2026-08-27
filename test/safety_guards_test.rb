@@ -37,6 +37,25 @@ class SafetyGuardsTest < Minitest::Test
     end
 
     assert_equal Searchkick::MultiTenant::TenantReindexer::DEFAULT_REFRESH_INTERVAL, captured[:refresh_interval]
+    assert_equal Searchkick::MultiTenant::TenantReindexer::DEFAULT_REPLICAS_DURING_REINDEX, captured[:replicas]
+  end
+
+  # regression check: FullReindexGuard#full_reindex's disabled-model branch
+  # explicitly lists which keywords it forwards to stock Searchkick's
+  # full_reindex rather than using a bare `super` — stock has no replicas:
+  # keyword at all, so a bare super forwarding it would raise
+  # "ArgumentError: unknown keyword: :replicas" for every disabled-model
+  # reindex the moment replicas: got a real default value.
+  def test_bare_reindex_does_not_raise_when_globally_disabled
+    Searchkick::MultiTenant.configure { |c| c.enabled = false }
+
+    as_tenant("acme") { Product.reindex }
+  ensure
+    Searchkick::MultiTenant.configure { |c| c.enabled = true }
+    # stock full_reindex (the path just exercised) promotes a single-tenant,
+    # non-composite-id index over the shared alias — put it back the way
+    # every other test in this file expects to find it
+    Searchkick::MultiTenant::TenantReindexer.call(Product)
   end
 
   def test_reindex_with_unmappable_option_raises
