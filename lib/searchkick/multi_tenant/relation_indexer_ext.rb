@@ -56,48 +56,58 @@ module Searchkick
       # matches few or zero of this tenant's own rows once
       # searchkick_tenant_scope's WHERE is applied.
       #
-      # First fix attempt walked actual rows (find_in_batches, record_ids:
-      # per batch) — correct, but turned batch enumeration into O(row
-      # count) synchronous work PER TENANT, so TenantReindexer's per-tenant
-      # loop went from "all tenants' batches queued almost instantly" (the
-      # old min/max cost) to "tenant B doesn't even start being enumerated
-      # until tenant A's entire row set has been walked" — trading a
-      # correctness bug for a concurrency regression.
+      # Fix: min_id/max_id windows still work fine — they're a compact way
+      # to describe a batch — as long as they're derived from what this
+      # TENANT'S rows actually are, not assumed from arithmetic on the
+      # whole table's id range. find_in_batches already walks the (tenant-
+      # scoped) relation correctly — it's what Rails itself uses for batch
+      # processing, ordered by primary key by default, no manual ordering
+      # needed here. For each real chunk it yields, min_id/max_id are just
+      # that chunk's own smallest/largest id — since those ids come from
+      # THIS tenant's actual rows, `tenant_scope AND id BETWEEN` matches
+      # that chunk exactly, no other row of this tenant falls in that span.
       #
-      # This is the actual fix: COUNT is the same O(1) query cost as the
-      # old MIN/MAX, but the batch count it produces is correct regardless
-      # of id density. Each batch then carries offset:/limit: instead of a
-      # min_id/max_id window or a pre-enumerated id list — BulkReindexJobExt
-      # applies the tenant scope + offset/limit itself when the job actually
-      # runs, so no row enumeration happens here at all.
+      # Also handles non-numeric (e.g. UUID) primary keys — stock
+      # Searchkick's own min/max branch requires Numeric ids because it
+      # does arithmetic ((max-min)/batch_size); comparing real boundary
+      # values with BETWEEN needs no arithmetic, just orderability, which
+      # every primary key type has.
       #
-      # offset/limit is re-evaluated against ORDER BY id at execution time
-      # rather than pinned like min_id/max_id or record_ids, but this is
-      # still safe against concurrent writes during the reindex: a delete
-      # shifts every later row's *position* down by one uniformly, and
-      # since these windows partition by position (not id value), the
-      # union of fixed-size windows computed from the original count still
-      # covers every surviving row exactly once — no duplicates, no skips,
-      # the last batch (or few) just does less work or nothing.
+      # find_in_batches itself carries this caveat: a row inserted after a
+      # chunk's boundary is captured won't retroactively be picked up by
+      # this run, same as Rails' own batch processing. Closed for free for
+      # the LAST batch specifically: it's marked last: true (BulkReindexJobExt
+      # then treats its range as open-ended, min_id and up), so it picks up
+      # whatever's actually in the tenant's scope by the time it executes,
+      # snapshot-inserts included.
       #
-      # The one case that isn't automatically covered: a row inserted after
-      # this COUNT snapshot lands past whatever the snapshot covered, so a
-      # *fixed*-size last batch wouldn't reach it. Solved by not fixing the
-      # last batch's size at all — offset:, no limit:, so it just takes
-      # whatever remains in the scope from its offset onward at execution
-      # time, snapshot-inserts included.
+      # find_in_batches doesn't tell you in advance whether the chunk it
+      # just handed you is the last one — a chunk's size only proves "last"
+      # when it's smaller than batch_size; an exact-multiple total makes
+      # the true last chunk indistinguishable from a middle one by size
+      # alone. So: hold each batch back one iteration before dispatching
+      # it. By the time we dispatch batch N, we already know whether batch
+      # N+1 exists (we're either mid-loop, or the loop just ended) — no
+      # ambiguity, no extra queries, just one small pending batch (a few
+      # ids, not real records) held in memory at a time.
       def full_reindex_async(relation, job_options: nil)
         return super unless @multitenant_tenant
 
         class_name = relation.searchkick_options[:class_name]
-        count = relation.count
-        return if count.zero?
+        batch_id = 1
+        pending_batch = nil
 
-        batches_count = (count / batch_size.to_f).ceil
-        batches_count.times do |i|
-          last_batch = i == batches_count - 1
-          batch_job(class_name, i + 1, job_options, offset: i * batch_size, limit: last_batch ? nil : batch_size)
+        relation.find_in_batches(batch_size: batch_size) do |batch|
+          dispatch_pending_batch(class_name, job_options, pending_batch, last: false) if pending_batch
+          ids = batch.map(&:id)
+          pending_batch = {batch_id: batch_id, min_id: ids.min, max_id: ids.max}
+          batch_id += 1
         end
+        dispatch_pending_batch(class_name, job_options, pending_batch, last: true) if pending_batch
+      end
+
+      def dispatch_pending_batch(class_name, job_options, pending_batch, last:)
+        batch_job(class_name, pending_batch[:batch_id], job_options, min_id: pending_batch[:min_id], max_id: pending_batch[:max_id], last: last)
       end
     end
   end

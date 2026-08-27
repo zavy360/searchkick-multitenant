@@ -119,14 +119,15 @@ class TenantReindexerOptionsTest < Minitest::Test
   # 6 rows interleaved acme/globex/acme/globex/acme/globex means acme's own
   # ids span 1..5 despite acme owning only 3 rows — at batch_size 2 the old
   # id-span math would derive 3 batches (ceil(5/2)) from that span; correct
-  # batching (COUNT-derived, not id-span-derived) must derive 2 (ceil(3/2)).
+  # batching (derived from acme's own actual ids: 1, 3, 5) must derive 2.
   def test_row_based_batch_count_matches_actual_rows_not_id_span
     clear_enqueued_jobs
-    as_tenant("acme") { Ticket.create!(name: "A1", account_id: "acme") }
+    acme_ids = []
+    as_tenant("acme") { acme_ids << Ticket.create!(name: "A1", account_id: "acme").id }
     as_tenant("globex") { Ticket.create!(name: "G1", account_id: "globex") }
-    as_tenant("acme") { Ticket.create!(name: "A2", account_id: "acme") }
+    as_tenant("acme") { acme_ids << Ticket.create!(name: "A2", account_id: "acme").id }
     as_tenant("globex") { Ticket.create!(name: "G2", account_id: "globex") }
-    as_tenant("acme") { Ticket.create!(name: "A3", account_id: "acme") }
+    as_tenant("acme") { acme_ids << Ticket.create!(name: "A3", account_id: "acme").id }
     as_tenant("globex") { Ticket.create!(name: "G3", account_id: "globex") }
 
     with_stubbed_batch_size(2) do
@@ -136,17 +137,18 @@ class TenantReindexerOptionsTest < Minitest::Test
     bulk_jobs = enqueued_jobs.select { |j| j[:job] == Searchkick::BulkReindexJob }
     assert_equal 4, bulk_jobs.size, "3 rows per tenant at batch_size 2 should be 2 batches per tenant (4 total), not batches derived from each tenant's full id span"
 
-    acme_jobs = bulk_jobs.select { |j| j[:args].first["batch_id"].start_with?("acme::") }.sort_by { |j| j[:args].first["offset"] }
-    assert_equal [{"offset" => 0, "limit" => 2}, {"offset" => 2, "limit" => nil}],
-      acme_jobs.map { |j| j[:args].first.slice("offset", "limit") },
-      "first batch is offset/fixed-size, last batch is offset/no-limit so it can absorb late inserts"
+    acme_jobs = bulk_jobs.select { |j| j[:args].first["batch_id"].start_with?("acme::") }.sort_by { |j| j[:args].first["min_id"] }
+    assert_equal [{"min_id" => acme_ids[0], "max_id" => acme_ids[1], "last" => false}, {"min_id" => acme_ids[2], "max_id" => acme_ids[2], "last" => true}],
+      acme_jobs.map { |j| j[:args].first.slice("min_id", "max_id", "last") },
+      "min_id/max_id must come from acme's own actual ids per find_in_batches chunk, not arithmetic on the shared table's id range — and only the true last batch is marked last: true"
   end
 
-  # the unbounded last batch (offset:, no limit:) exists specifically so a
-  # row created after full_reindex_async's COUNT snapshot — but before that
-  # last batch actually runs — still gets picked up, instead of silently
-  # falling outside every batch's window.
-  def test_last_batch_has_no_limit_and_picks_up_rows_inserted_after_the_count_snapshot
+  # last: true (BulkReindexJobExt then queries min_id and up, ignoring
+  # max_id) is what lets a tenant's last batch pick up a row inserted into
+  # its scope after full_reindex_async's find_in_batches enumeration
+  # reached it, instead of silently excluding anything past that batch's
+  # snapshot max_id.
+  def test_last_batch_picks_up_rows_inserted_after_it_was_enumerated
     clear_enqueued_jobs
     as_tenant("acme") { Ticket.create!(name: "A1", account_id: "acme") }
 
@@ -154,8 +156,8 @@ class TenantReindexerOptionsTest < Minitest::Test
       Searchkick::MultiTenant::TenantReindexer.call(Ticket, mode: :async)
     end
 
-    # simulates a row landing after full_reindex_async's COUNT snapshot was
-    # taken but before the (already-enqueued) batch job actually runs
+    # simulates a row landing in this tenant's scope after
+    # full_reindex_async already enumerated (and dispatched) its batch
     as_tenant("acme") { Ticket.create!(name: "A2 (late)", account_id: "acme") }
 
     perform_enqueued_jobs
