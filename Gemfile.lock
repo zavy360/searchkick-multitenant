@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    searchkick-multitenant (0.1.9)
+    searchkick-multitenant (0.1.10)
       searchkick (>= 5.4, < 7)
 
 GEM
