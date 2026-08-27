@@ -16,29 +16,32 @@ module Searchkick
     # Fix: qualify batch_id with whichever tenant this call is for, passed
     # explicitly as a `tenant:` keyword argument (from TenantReindexer, all
     # the way down through Index#import_scope's **options passthrough) and
-    # stashed as a plain instance variable on `self` — not Thread.current.
+    # stashed in Thread.current — not a plain instance variable.
     # `Index#relation_indexer` memoizes one RelationIndexer per Index
-    # object, reused across every tenant's `import_scope` call in
-    # TenantReindexer's sequential (never concurrent) per-tenant loop, so
-    # `@multitenant_tenant` set at the top of one `reindex` call is exactly
-    # as safe as `full_reindex_async`'s own local `batch_id` variable: it's
-    # read later in the same synchronous call chain, on the same object,
-    # before the next tenant's call ever touches it again.
+    # object, reused across every tenant's `import_scope` call — and
+    # TenantReindexer.call now runs multiple tenants' import_tenant calls
+    # concurrently in a thread pool (see tenant_reindexer.rb), all sharing
+    # that SAME memoized RelationIndexer instance. A plain instance
+    # variable would race across those threads (tenant A's batch could get
+    # tagged with tenant B's identity mid-flight); Thread.current isolates
+    # each concurrent tenant's value to the thread actually processing it.
     module RelationIndexerTenantExt
       def reindex(relation, mode:, method_name: nil, ignore_missing: nil, full: false, resume: false, scope: nil, job_options: nil, tenant: nil)
-        @multitenant_tenant = tenant
+        previous_tenant = Thread.current[:searchkick_multitenant_tenant]
+        Thread.current[:searchkick_multitenant_tenant] = tenant
         super(relation, mode: mode, method_name: method_name, ignore_missing: ignore_missing, full: full, resume: resume, scope: scope, job_options: job_options)
       ensure
-        @multitenant_tenant = nil
+        Thread.current[:searchkick_multitenant_tenant] = previous_tenant
       end
 
       def batch_job(class_name, batch_id, job_options, **options)
-        if @multitenant_tenant
-          batch_id = "#{@multitenant_tenant}::#{batch_id}"
+        tenant = Thread.current[:searchkick_multitenant_tenant]
+        if tenant
+          batch_id = "#{tenant}::#{batch_id}"
           # explicit, not ambient: this loop never touches "current tenant"
           # state for row-based tenancy, so BulkReindexJobExt can't rely on
           # CapturesTenantAtEnqueue's ambient capture here — see async_job_ext.rb
-          options = options.merge(multitenant_tenant: @multitenant_tenant)
+          options = options.merge(multitenant_tenant: tenant)
         end
         super(class_name, batch_id, job_options, **options)
       end
@@ -91,7 +94,7 @@ module Searchkick
       # ambiguity, no extra queries, just one small pending batch (a few
       # ids, not real records) held in memory at a time.
       def full_reindex_async(relation, job_options: nil)
-        return super unless @multitenant_tenant
+        return super unless Thread.current[:searchkick_multitenant_tenant]
 
         class_name = relation.searchkick_options[:class_name]
         batch_id = 1

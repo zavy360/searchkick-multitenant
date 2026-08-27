@@ -128,6 +128,22 @@ class AsyncJobTest < Minitest::Test
     Searchkick::MultiTenant.configure { |c| c.around_reindex_read = ->(&block) { block.call } }
   end
 
+  # regression test: offset:/limit: is a dead job shape — nothing enqueues
+  # it anymore (superseded by min_id:/max_id:) — but a job serialized by an
+  # already-deployed process before a rollout is a fixed payload already
+  # sitting in Sidekiq's queue. Deploying newer code must not turn those
+  # into permanently dead jobs raising "unknown keywords: :offset, :limit".
+  def test_legacy_offset_limit_job_shape_still_performs
+    as_tenant("acme") { Article.create!(id: 1, title: "Acme Doc") }
+    index = Article.searchkick_index
+
+    Searchkick::BulkReindexJob.new.perform(class_name: "Article", index_name: index.name, batch_id: "1", offset: 0, limit: 10, multitenant_tenant: "acme")
+    index.refresh
+
+    doc = Searchkick.client.get(index: index.name, id: "acme::1")
+    assert_equal "Acme Doc", doc["_source"]["title"]
+  end
+
   private
 
   # minitest 6 dropped Mock/Object#stub, and this is the only place we need

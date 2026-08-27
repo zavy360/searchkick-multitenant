@@ -95,7 +95,12 @@ class TenantReindexerOptionsTest < Minitest::Test
     refute result[:promoted], "must not promote before the async jobs have actually imported anything"
     assert_equal before_index, current_alias_target, "old index must still be serving reads"
 
-    # simulate the background worker actually running the enqueued jobs
+    # simulate the background worker actually running the enqueued jobs —
+    # mode: :async enqueues one TenantImportJob per tenant first; running
+    # those enqueues the actual BulkReindexJob batches, so draining the
+    # queue fully takes two rounds, same as a real worker would just do
+    # continuously
+    perform_enqueued_jobs
     perform_enqueued_jobs
 
     result = Searchkick::MultiTenant::TenantReindexer.call(Ticket, resume: true, mode: :async, wait: true)
@@ -132,6 +137,10 @@ class TenantReindexerOptionsTest < Minitest::Test
 
     with_stubbed_batch_size(2) do
       Searchkick::MultiTenant::TenantReindexer.call(Ticket, mode: :async)
+      # mode: :async enqueues one TenantImportJob per tenant, not the
+      # BulkReindexJob batches directly — those only get enqueued once a
+      # TenantImportJob actually runs and enumerates its tenant's rows
+      perform_enqueued_jobs
     end
 
     bulk_jobs = enqueued_jobs.select { |j| j[:job] == Searchkick::BulkReindexJob }
@@ -154,13 +163,17 @@ class TenantReindexerOptionsTest < Minitest::Test
 
     with_stubbed_batch_size(2) do
       Searchkick::MultiTenant::TenantReindexer.call(Ticket, mode: :async)
+      # runs the TenantImportJob, which enumerates acme's one row and
+      # enqueues its (last, so open-ended) BulkReindexJob batch — but
+      # doesn't run that batch job yet
+      perform_enqueued_jobs
     end
 
     # simulates a row landing in this tenant's scope after
     # full_reindex_async already enumerated (and dispatched) its batch
     as_tenant("acme") { Ticket.create!(name: "A2 (late)", account_id: "acme") }
 
-    perform_enqueued_jobs
+    perform_enqueued_jobs # now runs the BulkReindexJob batch itself
     Ticket.searchkick_index.refresh
 
     names = Searchkick.client.search(index: Ticket.searchkick_index.name, body: {query: {match_all: {}}})["hits"]["hits"].map { |h| h["_source"]["name"] }.sort

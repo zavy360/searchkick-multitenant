@@ -75,35 +75,45 @@ module Searchkick::MultiTenant
         restore_replicas(new_index)
       end
 
-      pending_tenants(tenants_key).each do |tenant|
-        begin
-          import_tenant(new_index, tenant)
-          remove_from_checkpoint(tenants_key, tenant)
-        rescue => e
-          Searchkick.warn("[searchkick-multitenant] tenant #{tenant.inspect} failed to reindex into #{new_index.name}: #{e.message}")
+      if @mode == :async
+        # each pending tenant's import runs as its OWN background job
+        # (TenantImportJob) instead of inline here — that's what gives
+        # concurrency across tenants: Sidekiq's own worker pool already
+        # checks a DB connection out and back in correctly per job, so N
+        # tenants' find_in_batches walks (relation_indexer_ext.rb) run
+        # genuinely in parallel without this gem hand-rolling connection
+        # pool lifecycle management. See TenantImportJob's own comment for
+        # why that matters and what the first (thread-based) attempt at
+        # this got wrong.
+        enqueue_pending_tenants(new_index, tenants_key)
+
+        unless @wait
+          # every tenant's import is enqueued, but none has necessarily
+          # run yet, let alone the batches within it — promoting here
+          # could promote a near-empty index. Leave it unpromoted and let
+          # the caller finish later — poll `Searchkick.reindex_status`
+          # directly, or call this again with `resume: true, wait: true`.
+          return {index_name: new_index.name, incomplete_tenants: pending_tenants(tenants_key), promoted: false}
+        end
+
+        puts "Created index: #{new_index.name}"
+        puts "Jobs queued. Waiting for tenants..."
+        wait_for_tenants(tenants_key)
+        puts "Tenants done. Waiting for batches..."
+        wait_for_batches(new_index)
+      else
+        pending_tenants(tenants_key).each do |tenant|
+          begin
+            import_tenant(new_index, tenant)
+            remove_from_checkpoint(tenants_key, tenant)
+          rescue => e
+            Searchkick.warn("[searchkick-multitenant] tenant #{tenant.inspect} failed to reindex into #{new_index.name}: #{e.message}")
+          end
         end
       end
 
       remaining = pending_tenants(tenants_key)
       raise PartialReindexError, remaining if remaining.any? && !@force_promote_incomplete
-
-      # :async without wait: every tenant's import jobs are enqueued (they
-      # all target new_index, so Searchkick's own batches_key — keyed only
-      # by index name — aggregates completion across every tenant for
-      # free), but they haven't necessarily run yet. Promoting here would
-      # promote a possibly-empty index. Matches Searchkick's own full_reindex:
-      # leave it unpromoted and let the caller finish the job later — poll
-      # `Searchkick.reindex_status(new_index.name)` directly, or call this
-      # again with `resume: true, wait: true` to block until done and promote.
-      if @mode == :async && !@wait
-        return {index_name: new_index.name, incomplete_tenants: remaining, promoted: false}
-      end
-
-      if @mode == :async && @wait
-        puts "Created index: #{new_index.name}"
-        puts "Jobs queued. Waiting..."
-        wait_for_batches(new_index)
-      end
 
       if alias_existed
         # Index#check_uuid does exactly this, but it's a protected method —
@@ -130,6 +140,38 @@ module Searchkick::MultiTenant
       model.searchkick_tenant_scope(tenant) do |relation|
         index.import_scope(relation, mode: mode, full: false, scope: scope)
       end
+    end
+
+    # public (not private): TenantImportJob calls both of these directly —
+    # each background job reconstructs a plain TenantReindexer(mode: :async,
+    # job_options:, scope:) for the one tenant it's responsible for and
+    # drives it through the exact same retry/around_reindex_read logic
+    # `call`'s own (mode: :inline) loop uses, rather than duplicating it.
+    def import_tenant(new_index, tenant)
+      attempts = 0
+      begin
+        attempts += 1
+        # around_reindex_read wraps the OUTSIDE of searchkick_tenant_scope,
+        # not the inside: for schema-based (Apartment-style) tenancy, the
+        # tenant switch sets search_path on whatever connection is checked
+        # out at that moment. If a read-replica role were selected *after*
+        # the switch, it'd select a different connection that never got the
+        # switch applied — silently reading the wrong tenant's schema (or
+        # none). Selecting the role first means the switch lands on the
+        # connection that role actually resolves to.
+        Searchkick::MultiTenant.config.around_reindex_read.call do
+          @model.searchkick_tenant_scope(tenant) do |relation|
+            new_index.import_scope(relation, mode: @mode, full: true, job_options: @job_options, scope: @scope, tenant: tenant)
+          end
+        end
+      rescue => e
+        retry if attempts < RETRIES
+        raise e
+      end
+    end
+
+    def remove_from_checkpoint(tenants_key, tenant)
+      Searchkick.with_redis { |r| r.call("SREM", tenants_key, tenant) }
     end
 
     private
@@ -174,39 +216,35 @@ module Searchkick::MultiTenant
       Searchkick.with_redis { |r| r.call("SMEMBERS", tenants_key) } || []
     end
 
-    def remove_from_checkpoint(tenants_key, tenant)
-      Searchkick.with_redis { |r| r.call("SREM", tenants_key, tenant) }
+    def enqueue_pending_tenants(new_index, tenants_key)
+      pending_tenants(tenants_key).each do |tenant|
+        TenantImportJob.set(**(@job_options || {})).perform_later(
+          class_name: @model.name,
+          tenant: tenant,
+          new_index_name: new_index.name,
+          tenants_key: tenants_key,
+          mode: @mode,
+          job_options: @job_options,
+          scope: @scope
+        )
+      end
     end
 
-    def import_tenant(new_index, tenant)
-      attempts = 0
-      begin
-        attempts += 1
-        # around_reindex_read wraps the OUTSIDE of searchkick_tenant_scope,
-        # not the inside: for schema-based (Apartment-style) tenancy, the
-        # tenant switch sets search_path on whatever connection is checked
-        # out at that moment. If a read-replica role were selected *after*
-        # the switch, it'd select a different connection that never got the
-        # switch applied — silently reading the wrong tenant's schema (or
-        # none). Selecting the role first means the switch lands on the
-        # connection that role actually resolves to.
-        Searchkick::MultiTenant.config.around_reindex_read.call do
-          @model.searchkick_tenant_scope(tenant) do |relation|
-            new_index.import_scope(relation, mode: @mode, full: true, job_options: @job_options, scope: @scope, tenant: tenant)
-          end
-        end
-      rescue => e
-        retry if attempts < RETRIES
-        raise e
+    def wait_for_tenants(tenants_key)
+      loop do
+        remaining = pending_tenants(tenants_key)
+        break if remaining.empty?
+        puts "Tenants left: #{remaining.size}"
+        sleep 3
       end
     end
 
     def wait_for_batches(new_index)
       loop do
-        sleep 3
         status = Searchkick.reindex_status(new_index.name)
         break if status[:completed]
         puts "Batches left: #{status[:batches_left]}"
+        sleep 3
       end
     end
   end
