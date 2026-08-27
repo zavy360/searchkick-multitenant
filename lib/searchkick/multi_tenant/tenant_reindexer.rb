@@ -96,10 +96,10 @@ module Searchkick::MultiTenant
           return {index_name: new_index.name, incomplete_tenants: pending_tenants(tenants_key), promoted: false}
         end
 
-        puts "Created index: #{new_index.name}"
-        puts "Jobs queued. Waiting for tenants..."
+        log "Created index: #{new_index.name}"
+        log "Jobs queued. Waiting for tenants..."
         wait_for_tenants(tenants_key)
-        puts "Tenants done. Waiting for batches..."
+        log "Tenants done. Waiting for batches..."
         wait_for_batches(new_index)
       else
         pending_tenants(tenants_key).each do |tenant|
@@ -122,12 +122,12 @@ module Searchkick::MultiTenant
           raise Error, "Safety check failed - only run one Model.reindex/TenantReindexer per model at a time"
         end
 
-        puts "Jobs complete. Promoting..." if @mode == :async && @wait
+        log "Jobs complete. Promoting..." if @mode == :async && @wait
         @index.promote(new_index.name, update_refresh_interval: !@refresh_interval.nil?)
         restore_replicas(new_index)
       end
       @index.clean_indices unless @retain
-      puts "SUCCESS!" if @mode == :async && @wait
+      log "SUCCESS!" if @mode == :async && @wait
 
       {index_name: new_index.name, incomplete_tenants: remaining, promoted: true}
     end
@@ -234,7 +234,7 @@ module Searchkick::MultiTenant
       loop do
         remaining = pending_tenants(tenants_key)
         break if remaining.empty?
-        puts "Tenants left: #{remaining.size}"
+        log "Tenants left: #{remaining.size}"
         sleep 3
       end
     end
@@ -243,9 +243,22 @@ module Searchkick::MultiTenant
       loop do
         status = Searchkick.reindex_status(new_index.name)
         break if status[:completed]
-        puts "Batches left: #{status[:batches_left]}"
+        log "Batches left: #{status[:batches_left]}"
         sleep 3
       end
+    end
+
+    # plain `puts` is not enough here: this runs inside a long-lived
+    # background job, and Ruby's stdout is block-buffered (not
+    # line-buffered) whenever it isn't a TTY — the normal case for a
+    # worker process whose output is redirected to a file or piped to a
+    # log collector. Without an explicit flush, these lines can sit in an
+    # internal buffer for the entire multi-hour duration of a large
+    # reindex — or be lost outright if the worker restarts — even though
+    # the reindex itself is progressing correctly the whole time.
+    def log(message)
+      puts message
+      $stdout.flush
     end
   end
 end
