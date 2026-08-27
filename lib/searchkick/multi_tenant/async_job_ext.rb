@@ -88,10 +88,15 @@ module Searchkick
         tenant = multitenant_tenant || @multitenant_tenant
 
         Timeout.timeout(Searchkick::MultiTenant.config.batch_job_timeout) do
-          model.searchkick_tenant_scope(tenant) do |relation|
-            relation = Searchkick.load_records(relation, ids)
-            relation = relation.search_import if relation.respond_to?(:search_import)
-            Searchkick::RecordIndexer.new(index).reindex(relation, mode: :inline, method_name: method_name, ignore_missing: ignore_missing, full: false)
+          # around_reindex_read wraps the OUTSIDE of searchkick_tenant_scope
+          # — see the matching comment in tenant_reindexer.rb#import_tenant
+          # for why the ordering matters for schema-based tenancy.
+          Searchkick::MultiTenant.config.around_reindex_read.call do
+            model.searchkick_tenant_scope(tenant) do |relation|
+              relation = Searchkick.load_records(relation, ids)
+              relation = relation.search_import if relation.respond_to?(:search_import)
+              Searchkick::RecordIndexer.new(index).reindex(relation, mode: :inline, method_name: method_name, ignore_missing: ignore_missing, full: false)
+            end
           end
         end
         Searchkick::RelationIndexer.new(index).batch_completed(batch_id) if batch_id

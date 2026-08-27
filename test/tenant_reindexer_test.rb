@@ -58,4 +58,25 @@ class TenantReindexerTest < Minitest::Test
     doc_ids = Searchkick.client.search(index: Product.searchkick_index.name, body: {query: {match_all: {}}})["hits"]["hits"].map { |h| h["_id"] }.sort
     assert_equal ["acme::1", "globex::1"], doc_ids
   end
+
+  # around_reindex_read (e.g. a read-replica role switch) must wrap OUTSIDE
+  # searchkick_tenant_scope's own switch — for schema-based tenancy the
+  # switch applies to whichever connection is checked out *at that moment*,
+  # so selecting a different connection role from inside the switch would
+  # leave that connection never having had the switch applied to it.
+  def test_around_reindex_read_wraps_outside_the_tenant_switch
+    order = []
+    Searchkick::MultiTenant.configure do |c|
+      c.around_reindex_read = ->(&block) {
+        order << Thread.current[:current_tenant]
+        block.call
+      }
+    end
+
+    Searchkick::MultiTenant::TenantReindexer.call(Product)
+
+    assert_equal [nil, nil], order, "hook must observe the pre-switch tenant (nil) for both tenants, never the tenant about to be switched to"
+  ensure
+    Searchkick::MultiTenant.configure { |c| c.around_reindex_read = ->(&block) { block.call } }
+  end
 end

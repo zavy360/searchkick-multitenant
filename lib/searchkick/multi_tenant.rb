@@ -34,6 +34,19 @@ module Searchkick::MultiTenant
       config.routing
     end
 
+    # true if ActiveRecord has a :reading role actually registered (via
+    # `connects_to database: { writing: ..., reading: ... }`) — not just
+    # present in database.yml, an established connection_handler entry.
+    # Checked at call time (not memoized) since connects_to typically runs
+    # during app boot, after this gem loads.
+    def reader_replica_configured?
+      return false unless defined?(ActiveRecord::Base)
+
+      ActiveRecord::Base.connection_handler.connection_pool_list(:reading).any?
+    rescue StandardError
+      false
+    end
+
     # "::" instead of "_" — tenant identifiers commonly contain underscores
     # (e.g. schema names), so a rarer delimiter avoids ambiguous splits.
     # Split on the id's own value, not on hit["_source"], since _source can

@@ -148,8 +148,18 @@ module Searchkick::MultiTenant
       attempts = 0
       begin
         attempts += 1
-        @model.searchkick_tenant_scope(tenant) do |relation|
-          new_index.import_scope(relation, mode: @mode, full: true, job_options: @job_options, scope: @scope, tenant: tenant)
+        # around_reindex_read wraps the OUTSIDE of searchkick_tenant_scope,
+        # not the inside: for schema-based (Apartment-style) tenancy, the
+        # tenant switch sets search_path on whatever connection is checked
+        # out at that moment. If a read-replica role were selected *after*
+        # the switch, it'd select a different connection that never got the
+        # switch applied — silently reading the wrong tenant's schema (or
+        # none). Selecting the role first means the switch lands on the
+        # connection that role actually resolves to.
+        Searchkick::MultiTenant.config.around_reindex_read.call do
+          @model.searchkick_tenant_scope(tenant) do |relation|
+            new_index.import_scope(relation, mode: @mode, full: true, job_options: @job_options, scope: @scope, tenant: tenant)
+          end
         end
       rescue => e
         retry if attempts < RETRIES

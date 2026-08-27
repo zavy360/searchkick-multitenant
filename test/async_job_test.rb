@@ -100,6 +100,30 @@ class AsyncJobTest < Minitest::Test
     end
   end
 
+  # around_reindex_read (e.g. a read-replica role switch) must wrap OUTSIDE
+  # searchkick_tenant_scope's own switch — for schema-based tenancy the
+  # switch applies to whichever connection is checked out *at that moment*,
+  # so selecting a different connection role from inside the switch would
+  # leave that connection never having had the switch applied to it.
+  def test_around_reindex_read_wraps_outside_the_tenant_switch
+    as_tenant("acme") { Article.create!(id: 1, title: "Acme Doc") }
+    index = Article.searchkick_index
+
+    seen_tenant = :not_called
+    Searchkick::MultiTenant.configure do |c|
+      c.around_reindex_read = ->(&block) {
+        seen_tenant = Thread.current[:current_tenant]
+        block.call
+      }
+    end
+
+    Searchkick::BulkReindexJob.new.perform(class_name: "Article", index_name: index.name, batch_id: "1", record_ids: [1], multitenant_tenant: "acme")
+
+    refute_equal "acme", seen_tenant, "hook fired after the tenant switch instead of before it"
+  ensure
+    Searchkick::MultiTenant.configure { |c| c.around_reindex_read = ->(&block) { block.call } }
+  end
+
   private
 
   # minitest 6 dropped Mock/Object#stub, and this is the only place we need
