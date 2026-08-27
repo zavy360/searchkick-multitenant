@@ -99,8 +99,13 @@ module Searchkick
 
         relation.find_in_batches(batch_size: batch_size) do |batch|
           dispatch_pending_batch(class_name, job_options, pending_batch, last: false) if pending_batch
-          ids = batch.map(&:id)
-          pending_batch = {batch_id: batch_id, min_id: ids.min, max_id: ids.max}
+          # first/last, not ids.min/ids.max: find_in_batches already yields
+          # this chunk in the exact order Postgres's own ORDER BY primary_key
+          # produced, so these ARE the DB's min/max already. Recomputing via
+          # Ruby's own comparison isn't guaranteed to agree with Postgres's
+          # for non-integer keys (collation-dependent for text/uuid columns,
+          # and case-sensitive in a way that doesn't track UUID magnitude).
+          pending_batch = {batch_id: batch_id, min_id: batch.first.id, max_id: batch.last.id}
           batch_id += 1
         end
         dispatch_pending_batch(class_name, job_options, pending_batch, last: true) if pending_batch
