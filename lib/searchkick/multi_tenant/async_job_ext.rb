@@ -77,14 +77,19 @@ module Searchkick
       # batch_job explicitly set it for a TenantReindexer-driven import.
       # Falls back to the ambient-captured @multitenant_tenant (from
       # CapturesTenantAtEnqueue) for the plain callback-triggered path.
-      def perform(class_name:, record_ids: nil, index_name: nil, method_name: nil, batch_id: nil, min_id: nil, max_id: nil, ignore_missing: nil, multitenant_tenant: nil)
+      #
+      # offset:/limit: is what relation_indexer_ext.rb's full_reindex_async
+      # actually dispatches now (see its own comment for why) — record_ids:/
+      # min_id:/max_id: are only still handled here so jobs already queued
+      # under the old shape keep working across a deploy, not because
+      # anything still enqueues them for a tenant-scoped batch.
+      def perform(class_name:, record_ids: nil, index_name: nil, method_name: nil, batch_id: nil, min_id: nil, max_id: nil, offset: nil, limit: nil, ignore_missing: nil, multitenant_tenant: nil)
         model = Searchkick.load_model(class_name)
         unless Searchkick::MultiTenant.enabled_for?(model)
           return super(class_name: class_name, record_ids: record_ids, index_name: index_name, method_name: method_name, batch_id: batch_id, min_id: min_id, max_id: max_id, ignore_missing: ignore_missing)
         end
 
         index = model.searchkick_index(name: index_name)
-        ids = record_ids || (min_id..max_id)
         tenant = multitenant_tenant || @multitenant_tenant
 
         Timeout.timeout(Searchkick::MultiTenant.config.batch_job_timeout) do
@@ -93,7 +98,12 @@ module Searchkick
           # for why the ordering matters for schema-based tenancy.
           Searchkick::MultiTenant.config.around_reindex_read.call do
             model.searchkick_tenant_scope(tenant) do |relation|
-              relation = Searchkick.load_records(relation, ids)
+              relation =
+                if offset || limit
+                  relation.reorder(relation.primary_key).offset(offset).limit(limit)
+                else
+                  Searchkick.load_records(relation, record_ids || (min_id..max_id))
+                end
               relation = relation.search_import if relation.respond_to?(:search_import)
               Searchkick::RecordIndexer.new(index).reindex(relation, mode: :inline, method_name: method_name, ignore_missing: ignore_missing, full: false)
             end

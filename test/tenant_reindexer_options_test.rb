@@ -119,7 +119,7 @@ class TenantReindexerOptionsTest < Minitest::Test
   # 6 rows interleaved acme/globex/acme/globex/acme/globex means acme's own
   # ids span 1..5 despite acme owning only 3 rows — at batch_size 2 the old
   # id-span math would derive 3 batches (ceil(5/2)) from that span; correct
-  # batching (walking acme's actual 3 rows) must derive 2 (ceil(3/2)).
+  # batching (COUNT-derived, not id-span-derived) must derive 2 (ceil(3/2)).
   def test_row_based_batch_count_matches_actual_rows_not_id_span
     clear_enqueued_jobs
     as_tenant("acme") { Ticket.create!(name: "A1", account_id: "acme") }
@@ -135,6 +135,34 @@ class TenantReindexerOptionsTest < Minitest::Test
 
     bulk_jobs = enqueued_jobs.select { |j| j[:job] == Searchkick::BulkReindexJob }
     assert_equal 4, bulk_jobs.size, "3 rows per tenant at batch_size 2 should be 2 batches per tenant (4 total), not batches derived from each tenant's full id span"
+
+    acme_jobs = bulk_jobs.select { |j| j[:args].first["batch_id"].start_with?("acme::") }.sort_by { |j| j[:args].first["offset"] }
+    assert_equal [{"offset" => 0, "limit" => 2}, {"offset" => 2, "limit" => nil}],
+      acme_jobs.map { |j| j[:args].first.slice("offset", "limit") },
+      "first batch is offset/fixed-size, last batch is offset/no-limit so it can absorb late inserts"
+  end
+
+  # the unbounded last batch (offset:, no limit:) exists specifically so a
+  # row created after full_reindex_async's COUNT snapshot — but before that
+  # last batch actually runs — still gets picked up, instead of silently
+  # falling outside every batch's window.
+  def test_last_batch_has_no_limit_and_picks_up_rows_inserted_after_the_count_snapshot
+    clear_enqueued_jobs
+    as_tenant("acme") { Ticket.create!(name: "A1", account_id: "acme") }
+
+    with_stubbed_batch_size(2) do
+      Searchkick::MultiTenant::TenantReindexer.call(Ticket, mode: :async)
+    end
+
+    # simulates a row landing after full_reindex_async's COUNT snapshot was
+    # taken but before the (already-enqueued) batch job actually runs
+    as_tenant("acme") { Ticket.create!(name: "A2 (late)", account_id: "acme") }
+
+    perform_enqueued_jobs
+    Ticket.searchkick_index.refresh
+
+    names = Searchkick.client.search(index: Ticket.searchkick_index.name, body: {query: {match_all: {}}})["hits"]["hits"].map { |h| h["_source"]["name"] }.sort
+    assert_equal ["A1", "A2 (late)"], names
   end
 
   private

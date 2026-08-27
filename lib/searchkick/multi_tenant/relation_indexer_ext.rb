@@ -56,20 +56,47 @@ module Searchkick
       # matches few or zero of this tenant's own rows once
       # searchkick_tenant_scope's WHERE is applied.
       #
-      # Fix: for a tenant-scoped call, always batch by actual matching
-      # rows (record_ids:, walked via find_in_batches) instead of a
-      # min_id/max_id window — exactly what stock Searchkick already does
-      # for non-numeric primary keys, just applied unconditionally here
-      # since "the id range is dense" can't be assumed once a relation is
-      # tenant-scoped on a shared table.
+      # First fix attempt walked actual rows (find_in_batches, record_ids:
+      # per batch) — correct, but turned batch enumeration into O(row
+      # count) synchronous work PER TENANT, so TenantReindexer's per-tenant
+      # loop went from "all tenants' batches queued almost instantly" (the
+      # old min/max cost) to "tenant B doesn't even start being enumerated
+      # until tenant A's entire row set has been walked" — trading a
+      # correctness bug for a concurrency regression.
+      #
+      # This is the actual fix: COUNT is the same O(1) query cost as the
+      # old MIN/MAX, but the batch count it produces is correct regardless
+      # of id density. Each batch then carries offset:/limit: instead of a
+      # min_id/max_id window or a pre-enumerated id list — BulkReindexJobExt
+      # applies the tenant scope + offset/limit itself when the job actually
+      # runs, so no row enumeration happens here at all.
+      #
+      # offset/limit is re-evaluated against ORDER BY id at execution time
+      # rather than pinned like min_id/max_id or record_ids, but this is
+      # still safe against concurrent writes during the reindex: a delete
+      # shifts every later row's *position* down by one uniformly, and
+      # since these windows partition by position (not id value), the
+      # union of fixed-size windows computed from the original count still
+      # covers every surviving row exactly once — no duplicates, no skips,
+      # the last batch (or few) just does less work or nothing.
+      #
+      # The one case that isn't automatically covered: a row inserted after
+      # this COUNT snapshot lands past whatever the snapshot covered, so a
+      # *fixed*-size last batch wouldn't reach it. Solved by not fixing the
+      # last batch's size at all — offset:, no limit:, so it just takes
+      # whatever remains in the scope from its offset onward at execution
+      # time, snapshot-inserts included.
       def full_reindex_async(relation, job_options: nil)
         return super unless @multitenant_tenant
 
-        batch_id = 1
         class_name = relation.searchkick_options[:class_name]
-        in_batches(relation) do |items|
-          batch_job(class_name, batch_id, job_options, record_ids: items.map(&:id).map { |v| v.instance_of?(Integer) ? v : v.to_s })
-          batch_id += 1
+        count = relation.count
+        return if count.zero?
+
+        batches_count = (count / batch_size.to_f).ceil
+        batches_count.times do |i|
+          last_batch = i == batches_count - 1
+          batch_job(class_name, i + 1, job_options, offset: i * batch_size, limit: last_batch ? nil : batch_size)
         end
       end
     end
