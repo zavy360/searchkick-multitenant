@@ -33,6 +33,18 @@ class RowBasedTest < Minitest::Test
     end
   end
 
+  # direct proof that current_tenant scopes relations themselves, not just
+  # search: a shared table means the only thing standing between tenants is
+  # `where(account_id: tenant)`, so this checks that even an exact primary
+  # key match for another tenant's row is unreachable through the wrong
+  # tenant's scope.
+  def test_tenant_scope_cannot_fetch_another_tenants_row_by_id
+    acme_id = Ticket.create!(name: "Acme Secret", account_id: "acme").id
+
+    leaked = Ticket.searchkick_tenant_scope("globex") { |relation| relation.where(id: acme_id) }
+    assert_empty leaked.to_a, "globex's tenant scope must not surface acme's row even when queried by its exact id"
+  end
+
   def test_without_tenant_scope_sees_both
     as_tenant("acme") do
       names = Searchkick.without_tenant_scope { Searchkick.search("login", model: Ticket, load: false) }.map { |r| r["name"] }

@@ -52,4 +52,63 @@ class AsyncJobTest < Minitest::Test
     refute Searchkick.client.exists(index: Article.searchkick_index.name, id: "acme::1"), "acme's deleted record should be removed from the index"
     assert Searchkick.client.exists(index: Article.searchkick_index.name, id: "globex::1"), "globex's still-valid record must survive a same-id delete for a different tenant"
   end
+
+  # regression coverage for the "Batches left" stuck-forever bug: a batch
+  # that keeps failing must eventually unblock batches_left (after
+  # batch_job_max_attempts) instead of leaving it stuck for however long
+  # Sidekiq's own retry backoff runs (or forever, if the job dies).
+  def test_batch_gives_up_and_unblocks_batches_left_after_max_attempts
+    index = Article.searchkick_index
+    relation_indexer = Searchkick::RelationIndexer.new(index)
+    Searchkick.with_redis { |r| r.call("SADD", "searchkick:reindex:#{index.name}:batches", ["1"]) }
+
+    Searchkick::MultiTenant.configure { |c| c.batch_job_max_attempts = 2 }
+
+    with_stubbed_new(Searchkick::RecordIndexer, ->(*) { raise "boom" }) do
+      2.times do
+        assert_raises(RuntimeError) do
+          Searchkick::BulkReindexJob.new.perform(class_name: "Article", index_name: index.name, batch_id: "1", record_ids: [1], multitenant_tenant: "acme")
+        end
+      end
+    end
+
+    assert_equal 0, relation_indexer.batches_left, "batch should be unblocked after max_attempts failed attempts"
+  ensure
+    Searchkick::MultiTenant.configure { |c| c.batch_job_max_attempts = 5 }
+  end
+
+  def test_batch_job_times_out_instead_of_hanging_forever
+    index = Article.searchkick_index
+    Searchkick.with_redis { |r| r.call("SADD", "searchkick:reindex:#{index.name}:batches", ["1"]) }
+
+    Searchkick::MultiTenant.configure do |c|
+      c.batch_job_timeout = 0.01
+      c.batch_job_max_attempts = 1
+    end
+
+    with_stubbed_new(Searchkick::RecordIndexer, ->(*) { sleep 1 }) do
+      assert_raises(Timeout::Error) do
+        Searchkick::BulkReindexJob.new.perform(class_name: "Article", index_name: index.name, batch_id: "1", record_ids: [1], multitenant_tenant: "acme")
+      end
+    end
+
+    assert_equal 0, Searchkick::RelationIndexer.new(index).batches_left, "timed-out batch should still give up and unblock after max_attempts"
+  ensure
+    Searchkick::MultiTenant.configure do |c|
+      c.batch_job_timeout = 300
+      c.batch_job_max_attempts = 5
+    end
+  end
+
+  private
+
+  # minitest 6 dropped Mock/Object#stub, and this is the only place we need
+  # it — swap the singleton method directly instead of adding a mocking gem.
+  def with_stubbed_new(klass, replacement)
+    original = klass.method(:new)
+    klass.define_singleton_method(:new) { |*args| replacement.call(*args) }
+    yield
+  ensure
+    klass.define_singleton_method(:new, original)
+  end
 end

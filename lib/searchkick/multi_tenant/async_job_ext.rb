@@ -1,3 +1,5 @@
+require "timeout"
+
 module Searchkick
   module MultiTenant
     # ReindexV2Job/BulkReindexJob (the `callbacks: :async` path, and
@@ -85,12 +87,46 @@ module Searchkick
         ids = record_ids || (min_id..max_id)
         tenant = multitenant_tenant || @multitenant_tenant
 
-        model.searchkick_tenant_scope(tenant) do |relation|
-          relation = Searchkick.load_records(relation, ids)
-          relation = relation.search_import if relation.respond_to?(:search_import)
-          Searchkick::RecordIndexer.new(index).reindex(relation, mode: :inline, method_name: method_name, ignore_missing: ignore_missing, full: false)
+        Timeout.timeout(Searchkick::MultiTenant.config.batch_job_timeout) do
+          model.searchkick_tenant_scope(tenant) do |relation|
+            relation = Searchkick.load_records(relation, ids)
+            relation = relation.search_import if relation.respond_to?(:search_import)
+            Searchkick::RecordIndexer.new(index).reindex(relation, mode: :inline, method_name: method_name, ignore_missing: ignore_missing, full: false)
+          end
         end
         Searchkick::RelationIndexer.new(index).batch_completed(batch_id) if batch_id
+      rescue => e
+        raise unless batch_id && index # index may be unset if load_model/searchkick_index itself raised
+
+        give_up_on_batch(index, batch_id, tenant, class_name, e) if batch_attempt_count(index, batch_id) >= Searchkick::MultiTenant.config.batch_job_max_attempts
+        raise
+      end
+
+      private
+
+      # a wedged worker thread or an endlessly-retrying job never calls
+      # batch_completed, so batches_key (and Searchkick.reindex_status's
+      # batches_left) would otherwise sit stuck forever — see
+      # async_job_ext.rb's module doc. This bounds that: give up on a batch
+      # after N failed attempts, unblock the counter, but still re-raise so
+      # the job stays visibly failed/dead in Sidekiq.
+      def batch_attempt_count(index, batch_id)
+        key = batch_attempts_key(index, batch_id)
+        Searchkick.with_redis do |r|
+          count = r.call("INCR", key)
+          r.call("EXPIRE", key, 86400)
+          count
+        end
+      end
+
+      def give_up_on_batch(index, batch_id, tenant, class_name, error)
+        Searchkick.warn("[searchkick-multitenant] giving up on batch #{batch_id.inspect} (tenant #{tenant.inspect}, #{class_name}) after #{Searchkick::MultiTenant.config.batch_job_max_attempts} attempts: #{error.class}: #{error.message}")
+        Searchkick::RelationIndexer.new(index).batch_completed(batch_id)
+        Searchkick.with_redis { |r| r.call("DEL", batch_attempts_key(index, batch_id)) }
+      end
+
+      def batch_attempts_key(index, batch_id)
+        "searchkick:reindex:#{index.name}:batch_attempts:#{batch_id}"
       end
     end
   end
