@@ -158,9 +158,13 @@ per tenant (a bulk update of that one field, no new index):
 
 ```ruby
 Searchkick::MultiTenant.each_tenant do |tenant|
-  Product.searchkick_tenant_scope(tenant) { |rel| rel.reindex(:search_record_id_data, ignore_missing: true) }
+  Product.searchkick_tenant_scope(tenant) { |rel| rel.reindex(:search_record_id_data, scope: :all, ignore_missing: true) }
 end
 ```
+
+`scope: :all` replaces the model's `search_import` scope, so the backfill doesn't eager-load
+associations it never uses. It only applies in inline mode (the default): async jobs reload records
+through `search_import` regardless.
 
 If a model uses a custom mapping with `dynamic: false` or `strict`, declare `searchkick_record_id`
 in it.
