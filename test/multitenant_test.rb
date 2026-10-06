@@ -50,6 +50,28 @@ class MultitenantTest < Minitest::Test
     end
   end
 
+  # _id holds "tenant::id", so where(id:) must target the real id field
+  # instead — callers filter by record id exactly as in stock Searchkick
+  def test_where_id_filters_by_real_record_id
+    as_tenant("acme") { Product.create!(id: 2, name: "Acme Gizmo") }
+    Product.searchkick_index.refresh
+
+    as_tenant("acme") do
+      assert_equal ["Acme Widget"], Product.search("*", where: {id: [1]}, load: false).map { |r| r["name"] }
+      assert_equal ["Acme Widget"], Product.search("*").where(id: 1).map(&:name)
+      assert_equal ["Acme Gizmo"], Product.search("*", where: {id: {not: 1}}, load: false).map { |r| r["name"] }
+      assert_equal ["Acme Gizmo"], Product.search("*", where: {id: {gt: 1}}, load: false).map { |r| r["name"] }
+      assert_equal ["Acme Gizmo"], Product.search("*", where: {_or: [{id: 2}, {id: 99}]}, load: false).map { |r| r["name"] }
+    end
+  end
+
+  def test_where_id_across_tenants_matches_each_tenants_record
+    as_tenant("acme") do
+      names = Searchkick.without_tenant_scope { Searchkick.search("*", model: Product, where: {id: 1}, load: false) }.map { |r| r["name"] }
+      assert_equal ["Acme Widget", "Globex Widget"], names.sort
+    end
+  end
+
   def test_without_tenant_scope_escape_hatch_sees_everything
     as_tenant("acme") do
       names = Searchkick.without_tenant_scope { Searchkick.search("widget", model: Product, load: false) }.map { |r| r["name"] }

@@ -7,7 +7,15 @@ module Searchkick::MultiTenant
     def search_data
       return super unless Searchkick::MultiTenant.enabled_for?(self.class)
 
-      super.merge(Searchkick::MultiTenant.tenant_field(self.class) => searchkick_tenant)
+      super.merge(Searchkick::MultiTenant.tenant_field(self.class) => searchkick_tenant).merge(search_record_id_data)
+    end
+
+    # record id mirrors upstream RecordData#search_id before our composite
+    # prefix, so `where(id:)` keeps honoring a custom search_document_id.
+    # Public so it doubles as a partial-reindex method for backfilling docs
+    # indexed before this field existed: `relation.reindex(:search_record_id_data)`
+    def search_record_id_data
+      {Searchkick::MultiTenant::RECORD_ID_FIELD => respond_to?(:search_document_id) ? search_document_id : id}
     end
   end
 

@@ -111,6 +111,7 @@ searchkick_multitenant tenant: :account_id # or tenant: ->{ account.subdomain },
 | `tenant` field in the indexed document | `search_data` override on the model (same extension point Searchkick's own default `search_data` uses) |
 | Reversing the composite `_id` back to a real DB id on read | `Module#prepend` on `Searchkick::Results` (`results_query`, `with_hit_and_missing_records`) |
 | Automatic `where: {tenant: current_tenant}` on every search | `Module#prepend` on `Searchkick.search` |
+| `where(id: ...)` filtering by real record id | `searchkick_record_id` field in the indexed document + `Module#prepend` on `Searchkick::Query#where_filters` |
 | `:queue` reindex mode (one Redis list shared by every tenant) | `Module#prepend` on `Searchkick::ReindexQueue`/`ProcessQueueJob`/`ProcessBatchJob`, adding a 3rd pipe-encoded field |
 | `:async` callback mode + full reindex's own async mode | `Module#prepend` on `Searchkick::ReindexV2Job`/`BulkReindexJob` (`serialize`/`deserialize`/`perform`) |
 | `Model.reindex`/`rake searchkick:reindex[:all]` covering every tenant, promoted once | `Module#prepend` on `Searchkick::Index#full_reindex`, delegating to `Searchkick::MultiTenant::TenantReindexer` (composed from `Index`'s existing public `create_index`/`import_scope`/`promote`/`clean_indices`) |
@@ -142,6 +143,27 @@ Cross-tenant/admin search:
 ```ruby
 Searchkick.without_tenant_scope { Product.search("widget") }
 ```
+
+## Filtering by id
+
+`_id` holds the composite `"tenant::id"`, so the gem also indexes the real id (`search_document_id`
+if defined, else `id`) as `searchkick_record_id`, and rewrites `where(id: ...)` to filter on that
+field. Callers filter by record id exactly as in stock Searchkick, with every operator (`in`, `not`,
+ranges, nested `_or`/`_and`). In a cross-tenant search, `where(id: 1)` matches id 1 in every tenant.
+An explicit `where(_id: ...)` still targets the raw composite `_id`.
+
+Documents indexed before this field existed don't have it, so `where(id:)` misses them until they
+are reindexed. Run a full `Model.reindex`, or backfill only the new field with a partial reindex
+per tenant (a bulk update of that one field, no new index):
+
+```ruby
+Searchkick::MultiTenant.each_tenant do |tenant|
+  Product.searchkick_tenant_scope(tenant) { |rel| rel.reindex(:search_record_id_data, ignore_missing: true) }
+end
+```
+
+If a model uses a custom mapping with `dynamic: false` or `strict`, declare `searchkick_record_id`
+in it.
 
 ## Multi-model search
 

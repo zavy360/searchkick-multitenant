@@ -67,10 +67,25 @@ class ConfigurationTest < Minitest::Test
       Searchkick::MultiTenant.configure { |c| c.enabled = false }
       assert_equal 1, data.search_id
       refute data.send(:search_data).key?(:tenant)
+      refute data.send(:search_data).key?(:searchkick_record_id)
 
       Searchkick::MultiTenant.configure { |c| c.enabled = true }
       assert_equal "acme::1", data.search_id
       assert_equal "acme", data.send(:search_data)[:tenant]
+      assert_equal 1, data.send(:search_data)[:searchkick_record_id]
+    end
+  end
+
+  # backfill path for docs indexed before searchkick_record_id existed: a
+  # partial update must still target the composite _id and tenant routing
+  def test_search_record_id_data_partial_update_targets_composite_doc
+    as_tenant("acme") do
+      product = Product.new(id: 1, name: "Widget")
+      update = Searchkick::RecordData.new(Product.searchkick_index, product).update_data(:search_record_id_data)[:update]
+
+      assert_equal "acme::1", update[:_id]
+      assert_equal "acme", update[:routing]
+      assert_equal({"searchkick_record_id" => 1}, update[:data][:doc].as_json)
     end
   end
 

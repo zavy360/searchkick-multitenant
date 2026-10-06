@@ -5,6 +5,12 @@ require "searchkick/multi_tenant/configuration"
 module Searchkick::MultiTenant
   class Error < StandardError; end
 
+  # the real (pre-composite) id, indexed in _source so `where(id:)` can
+  # keep filtering by record id (see QueryExt). Not named `id`: Searchkick
+  # rewrites any where-key "id" to `_id` (the composite) before building
+  # the filter.
+  RECORD_ID_FIELD = :searchkick_record_id
+
   class << self
     def configure
       yield config
@@ -95,6 +101,7 @@ require "searchkick/multi_tenant/model"
 require "searchkick/multi_tenant/record_data_ext"
 require "searchkick/multi_tenant/results_ext"
 require "searchkick/multi_tenant/search_ext"
+require "searchkick/multi_tenant/query_ext"
 require "searchkick/multi_tenant/relation_ext"
 require "searchkick/multi_tenant/queue_ext"
 require "searchkick/multi_tenant/async_job_ext"
