@@ -43,6 +43,10 @@ jobs:
             major, minor, patch = $1.to_i, $2.to_i, $3.to_i + 1
             version = "#{major}.#{minor}.#{patch}"
             File.write(path, content.sub(/VERSION = "[\d.]+"/, %(VERSION = "#{version}")))
+            # keep the lockfile'"'"'s path-gem version in sync, otherwise the next
+            # push fails `bundle install` in frozen mode on both workflows
+            lock = File.read("Gemfile.lock")
+            File.write("Gemfile.lock", lock.sub(/^    searchkick-multitenant \([\d.]+\)$/, "    searchkick-multitenant (#{version})"))
             File.write(ENV["GITHUB_OUTPUT"], "version=#{version}\n", mode: "a")
           ' "$path"
 
@@ -50,7 +54,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add lib/searchkick/multi_tenant/version.rb
+          git add lib/searchkick/multi_tenant/version.rb Gemfile.lock
           git commit -m "Bump version to ${{ steps.bump.outputs.version }} [skip ci]"
           git tag "v${{ steps.bump.outputs.version }}"
           git push origin main
