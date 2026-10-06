@@ -72,7 +72,7 @@ class ConfigurationTest < Minitest::Test
       Searchkick::MultiTenant.configure { |c| c.enabled = true }
       assert_equal "acme::1", data.search_id
       assert_equal "acme", data.send(:search_data)[:tenant]
-      assert_equal 1, data.send(:search_data)[:searchkick_record_id]
+      assert_equal "1", data.send(:search_data)[:searchkick_record_id]
     end
   end
 
@@ -85,7 +85,7 @@ class ConfigurationTest < Minitest::Test
 
       assert_equal "acme::1", update[:_id]
       assert_equal "acme", update[:routing]
-      assert_equal({"searchkick_record_id" => 1}, update[:data][:doc].as_json)
+      assert_equal({"searchkick_record_id" => "1"}, update[:data][:doc].as_json)
     end
   end
 

@@ -12,10 +12,13 @@ module Searchkick::MultiTenant
 
     # record id mirrors upstream RecordData#search_id before our composite
     # prefix, so `where(id:)` keeps honoring a custom search_document_id.
+    # Stringified (and mapped as keyword, see IndexOptionsExt) to match the
+    # `_id` it replaces: a numeric mapping makes any non-numeric filter value
+    # a 400 number_format_exception instead of simply matching nothing.
     # Public so it doubles as a partial-reindex method for backfilling docs
     # indexed before this field existed: `relation.reindex(:search_record_id_data)`
     def search_record_id_data
-      {Searchkick::MultiTenant::RECORD_ID_FIELD => respond_to?(:search_document_id) ? search_document_id : id}
+      {Searchkick::MultiTenant::RECORD_ID_FIELD => (respond_to?(:search_document_id) ? search_document_id : id)&.to_s}
     end
   end
 

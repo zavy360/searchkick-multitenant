@@ -60,9 +60,22 @@ class MultitenantTest < Minitest::Test
       assert_equal ["Acme Widget"], Product.search("*", where: {id: [1]}, load: false).map { |r| r["name"] }
       assert_equal ["Acme Widget"], Product.search("*").where(id: 1).map(&:name)
       assert_equal ["Acme Gizmo"], Product.search("*", where: {id: {not: 1}}, load: false).map { |r| r["name"] }
-      assert_equal ["Acme Gizmo"], Product.search("*", where: {id: {gt: 1}}, load: false).map { |r| r["name"] }
-      assert_equal ["Acme Gizmo"], Product.search("*", where: {_or: [{id: 2}, {id: 99}]}, load: false).map { |r| r["name"] }
+      assert_equal ["Acme Gizmo"], Product.search("*", where: {_or: [{id: "2"}, {id: 99}]}, load: false).map { |r| r["name"] }
     end
+  end
+
+  # regression: the field used to map as `long`, so a malformed (here
+  # double-encoded) id raised a 400 number_format_exception. As a keyword,
+  # like the `_id` it replaces, it simply matches nothing.
+  def test_where_id_with_non_numeric_value_matches_nothing
+    as_tenant("acme") do
+      assert_empty Product.search("*", where: {id: "\"1\""}, load: false).to_a
+    end
+  end
+
+  def test_record_id_field_is_mapped_as_keyword
+    properties = Product.searchkick_index.mapping.values.first["mappings"]["properties"]
+    assert_equal "keyword", properties["searchkick_record_id"]["type"]
   end
 
   def test_where_id_across_tenants_matches_each_tenants_record

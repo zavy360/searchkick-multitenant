@@ -148,9 +148,13 @@ Searchkick.without_tenant_scope { Product.search("widget") }
 
 `_id` holds the composite `"tenant::id"`, so the gem also indexes the real id (`search_document_id`
 if defined, else `id`) as `searchkick_record_id`, and rewrites `where(id: ...)` to filter on that
-field. Callers filter by record id exactly as in stock Searchkick, with every operator (`in`, `not`,
-ranges, nested `_or`/`_and`). In a cross-tenant search, `where(id: 1)` matches id 1 in every tenant.
-An explicit `where(_id: ...)` still targets the raw composite `_id`.
+field. Callers filter by record id exactly as in stock Searchkick (`in`, `not`, nested
+`_or`/`_and`). In a cross-tenant search, `where(id: 1)` matches id 1 in every tenant. An explicit
+`where(_id: ...)` still targets the raw composite `_id`.
+
+The field is a string mapped as `keyword` (the gem adds the mapping, also to custom `mappings:`),
+matching `_id`'s semantics: integer or string ids both match, a malformed value matches nothing
+instead of raising, and range operators compare as strings, as they did on `_id`.
 
 Documents indexed before this field existed don't have it, so `where(id:)` misses them until they
 are reindexed. Run a full `Model.reindex`, or backfill only the new field with a partial reindex
@@ -163,11 +167,17 @@ end
 ```
 
 `scope: :all` replaces the model's `search_import` scope, so the backfill doesn't eager-load
-associations it never uses. It only applies in inline mode (the default): async jobs reload records
-through `search_import` regardless.
+associations it never uses. The tenant scope's own `where`/`preload` is kept: `:all` is called on
+the relation `searchkick_tenant_scope` yields. If `searchkick_tenant`, `search_document_id` or
+`should_index?` reads an association that only `search_import` preloads (e.g.
+`tenant: -> { account.subdomain }`), pass a narrow named scope instead, such as
+`scope :search_record_id_import, -> { includes(:account) }` with `scope: :search_record_id_import`.
+`scope:` only applies in inline mode (the default): async jobs reload records through
+`search_import` regardless.
 
-If a model uses a custom mapping with `dynamic: false` or `strict`, declare `searchkick_record_id`
-in it.
+An index that already mapped `searchkick_record_id` as `long` (gem versions before the keyword
+mapping) can't change type in place: run a full `Model.reindex` to build a new index with the
+keyword mapping, since a partial backfill writes into the old mapping.
 
 ## Multi-model search
 
